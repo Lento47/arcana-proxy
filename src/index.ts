@@ -219,7 +219,7 @@ async function logUsage(env: Env, user: { id: string; tier: string }, model: str
 }
 
 async function listModels(env: Env, cors: Record<string, string>): Promise<Response> {
-  const response = await fetch(`${OPENROUTER_URL}/models`, {
+  const response = await fetch(`${OPENROUTER_URL}/v1/models`, {
     headers: { Authorization: `Bearer ${env.OPENROUTER_KEY}` },
   })
   const data = await response.json()
