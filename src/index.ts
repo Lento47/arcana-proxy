@@ -40,7 +40,15 @@ async function getUser(auth: string | null, kv: KVNamespace): Promise<{ id: stri
 
   // Check for dev key
   if (key.startsWith("ARCANA-DEV-")) {
-    user = { id: "dev-user", tier: "enterprise" }
+    user = { id: "Arcana Developer", tier: "enterprise" }
+    licenseCache.set(key, user)
+    return user
+  }
+
+  // Try account data for display name
+  const account = await kv.get(`account:${key}`, "json") as { email?: string; username?: string } | null
+  if (account) {
+    user = { id: account.username ?? account.email ?? "user", tier: "free" }
     licenseCache.set(key, user)
     return user
   }
