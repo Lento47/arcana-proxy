@@ -4,7 +4,7 @@ compatibility_date = "2026-06-01"
 workers_dev = true
 
 routes = [
-  { pattern = "api.arcana.otnelhq.com/v1/*", zone_id = "3c5d5afdbd04d5fda736a13e8008d659" }
+  { pattern = "proxy.arcana.otnelhq.com/v1/*", zone_id = "3c5d5afdbd04d5fda736a13e8008d659" }
 ]
 
 [[kv_namespaces]]
