@@ -1,0 +1,16 @@
+name = "arcana-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+workers_dev = true
+
+routes = [
+  { pattern = "api.arcana.otnelhq.com/v1/*", zone_id = "3c5d5afdbd04d5fda736a13e8008d659" }
+]
+
+[[kv_namespaces]]
+binding = "ARCANA_PROXY"
+id = "8c183296c8a14bd6857b1c896e7e5c3c"
+
+[[analytics_engine_datasets]]
+binding = "ARCANA_PROXY_ANALYTICS"
+dataset = "arcana_proxy_usage"
