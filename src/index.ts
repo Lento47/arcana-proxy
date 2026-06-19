@@ -1,8 +1,8 @@
 import type { AnalyticsEvent } from "./types"
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
-const PAYPAL_LIVE = "https://api.paypal.com"
-const PAYPAL_SANDBOX = "https://api.sandbox.paypal.com"
+const PAYPAL_LIVE = "https://api-m.paypal.com"
+const PAYPAL_SANDBOX = "https://api-m.sandbox.paypal.com"
 
 interface Env {
   OPENROUTER_KEY: string
