@@ -1,6 +1,6 @@
 import type { AnalyticsEvent } from "./types"
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1"
+const OPENROUTER_URL = "https://openrouter.ai/api"
 
 interface Env {
   OPENROUTER_KEY: string
