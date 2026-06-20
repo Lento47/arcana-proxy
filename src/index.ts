@@ -125,6 +125,15 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (user) return user
   const raw = await kv.get(`license:${key}`, "json") as any
   if (raw) { licenseCache.set(key, raw); return raw }
+  // Configurable admin keys (ARCANA_ADMIN_KEYS=key1,key2,...) — enterprise tier
+  if (env?.ARCANA_ADMIN_KEYS) {
+    const adminKeys = env.ARCANA_ADMIN_KEYS.split(",").map(k => k.trim()).filter(Boolean)
+    if (adminKeys.includes(key)) {
+      user = { id: "Admin", tier: "enterprise" }
+      licenseCache.set(key, user)
+      return user
+    }
+  }
   const account = await kv.get(`account:${key}`, "json") as any
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
   // Fallback: validate against license server (handles cross-KV namespace)
