@@ -409,19 +409,25 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
 async function handleCaptureOrder(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json() as any
-    const { orderId, userId } = body
-    if (!orderId || !userId) return json({ error: "Missing orderId or userId" }, 400, cors)
+    const { orderId } = body
+    if (!orderId) return json({ error: "Missing orderId" }, 400, cors)
 
-    // Verify the caller owns this userId by checking their auth
+    // Caller must be authenticated. Credits go to the caller's RESOLVED account id
+    // (the same identity /v1/balance and the subscription webhook use), so any real
+    // license key works — not just ARCANA-DEV keys. Body userId is no longer trusted.
     const auth = request.headers.get("Authorization")
-    const caller = await getUser(auth, env.ARCANA_PROXY)
+    const caller = await getUser(auth, env.ARCANA_PROXY, env)
     if (!caller) return json({ error: "unauthorized" }, 401, cors)
 
-    // Verify the caller matches the userId
-    if (caller.id !== userId && !userId.startsWith("ARCANA-DEV-")) {
-      // Allow dev key captures from any dev, but prevent user A from crediting user B
-      if (!auth?.includes("ARCANA-DEV-")) return json({ error: "forbidden" }, 403, cors)
+    const purchase = await env.ARCANA_PROXY.get(`purchase:${orderId}`, "json") as any
+    // Double-capture protection
+    if (purchase?.status === "completed") return json({ error: "order_already_captured" }, 400, cors)
+    // If the order was bound to a buyer at create time, only that buyer (or a dev) may capture it.
+    const isDev = auth?.includes("ARCANA-DEV-") ?? false
+    if (purchase?.creditUserId && purchase.creditUserId !== caller.id && !isDev) {
+      return json({ error: "forbidden" }, 403, cors)
     }
+    const creditTarget = purchase?.creditUserId ?? caller.id
 
     const token = await getPayPalToken(env)
     const base = paypalBase(env)
@@ -432,16 +438,12 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
     const capture = await captureRes.json() as any
     if (capture.status !== "COMPLETED") return json({ error: "payment_not_completed", status: capture.status }, 400, cors)
 
-    // Double-capture protection
-    const existingPurchase = await env.ARCANA_PROXY.get(`purchase:${orderId}`, "json") as any
-    if (existingPurchase?.status === "completed") return json({ error: "order_already_captured" }, 400, cors)
-
-    const amount = parseFloat(capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? "0")
+    const amount = parseFloat(capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? String(purchase?.amount ?? "0"))
     const credits = Math.round(amount * 100)
-    const existing = await env.ARCANA_PROXY.get(`balance:${userId}`, "json") as any
+    const existing = await env.ARCANA_PROXY.get(`balance:${creditTarget}`, "json") as any
     const currentCredits = existing?.credits ?? 0
-    await env.ARCANA_PROXY.put(`balance:${userId}`, JSON.stringify({ credits: currentCredits + credits, updatedAt: Date.now() }))
-    await env.ARCANA_PROXY.put(`purchase:${orderId}`, JSON.stringify({ userId, amount, credits, status: "completed" }), { expirationTtl: 86400 * 30 })
+    await env.ARCANA_PROXY.put(`balance:${creditTarget}`, JSON.stringify({ credits: currentCredits + credits, updatedAt: Date.now() }))
+    await env.ARCANA_PROXY.put(`purchase:${orderId}`, JSON.stringify({ ...(purchase ?? {}), creditUserId: creditTarget, amount, credits, status: "completed" }), { expirationTtl: 86400 * 30 })
 
     // Send receipt email (fire-and-forget)
     const email = request.headers.get("X-Receipt-Email")
