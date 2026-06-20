@@ -17,3 +17,26 @@ dataset = "arcana_proxy_usage"
 
 [[send_email]]
 name = "EMAIL"
+
+# ---------------------------------------------------------------------------
+# Staging — sandbox PayPal, workers.dev domain, no production routes
+#   npx wrangler deploy --env staging
+#   npx wrangler secret put --env staging PAYPAL_CLIENT_ID
+#   npx wrangler secret put --env staging PAYPAL_CLIENT_SECRET
+# ---------------------------------------------------------------------------
+[env.staging]
+workers_dev = true
+
+[env.staging.vars]
+PAYPAL_SANDBOX = "true"
+
+[[env.staging.kv_namespaces]]
+binding = "ARCANA_PROXY"
+id = "8c183296c8a14bd6857b1c896e7e5c3c"
+
+[[env.staging.analytics_engine_datasets]]
+binding = "ARCANA_PROXY_ANALYTICS"
+dataset = "arcana_proxy_usage"
+
+[[env.staging.send_email]]
+name = "EMAIL"
