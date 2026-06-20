@@ -68,6 +68,11 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (key.startsWith("ARCANA-DEV-")) { user = { id: "Arcana Developer", tier: "enterprise" }; licenseCache.set(key, user); return user }
   const account = await kv.get(`account:${key}`, "json") as any
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
+  // Email-based lookup (subscription users): token is an email address
+  if (key.includes("@")) {
+    const idx = await kv.get(`email_account:${key.toLowerCase()}`, "json") as any
+    if (idx) { user = { id: key.toLowerCase(), tier: idx.tier ?? "pro" }; licenseCache.set(key, user); return user }
+  }
   // Fallback: validate against license server (handles cross-KV namespace)
   try {
     const res = await fetch(`https://api.arcana.otnelhq.com/api/license/validate`, {
@@ -166,6 +171,7 @@ export default {
 
     try {
       // Public endpoints (IP rate limit only)
+      if (url.pathname === "/v1/identity/validate-email") return handleValidateEmail(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/create-order") return handleCreateOrder(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/capture-order") return handleCaptureOrder(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/capture-return") return handleCaptureReturn(request, env, corsHeaders)
@@ -312,12 +318,18 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
     const amount = Number(body.amount)
     if (!amount || amount < 5) return json({ error: "Minimum $5" }, 400, cors)
 
-    // Web flow: bind the buyer's Arcana key so we can auto-credit on PayPal return.
-    // CLI flow omits userId and captures explicitly via /v1/pay/capture-order.
+    // Web flow: bind the buyer's identity so we can auto-credit on PayPal return.
+    // Primary: email lookup (subscription users). Fallback: license key (non-subscribers).
+    // CLI flow omits both and captures explicitly via /v1/pay/capture-order.
     let creditUserId: string | null = null
-    if (body.userId) {
+    const email = body.email ? String(body.email).trim().toLowerCase() : null
+    if (email) {
+      const idx = await env.ARCANA_PROXY.get(`email_account:${email}`, "json") as any
+      if (!idx) return json({ error: "invalid_email", message: "Email not found. Subscribe first or use a license key." }, 400, cors)
+      creditUserId = email // balance:${email} is the canonical balance key for subscribers
+    } else if (body.userId) {
       const buyer = await getUser(`Bearer ${String(body.userId).trim()}`, env.ARCANA_PROXY, env)
-      if (!buyer) return json({ error: "invalid_key", message: "Arcana key not recognized" }, 400, cors)
+      if (!buyer) return json({ error: "invalid_key", message: "Arcana key not recognized. Use your email or license key." }, 400, cors)
       creditUserId = buyer.id
     }
 
@@ -480,6 +492,8 @@ async function handlePayPalWebhook(request: Request, env: Env, cors: Record<stri
         await env.ARCANA_PROXY.put(`license:${key}`, JSON.stringify({ id: email, tier: "pro", subscriptionId: subId, expiresAt }))
         await env.ARCANA_PROXY.put(`sub:${subId}`, JSON.stringify({ email, plan: planKey, status: "active", expiresAt, createdAt: Date.now() }), { expirationTtl: 365 * 86400 })
         // Add bundled credits ($5 = 500 credits)
+        // Reverse index: email → license key + sub ID for email-based lookup
+        await env.ARCANA_PROXY.put(`email_account:${email}`, JSON.stringify({ licenseKey: key, subId, tier: "pro", createdAt: Date.now() }), { expirationTtl: 365 * 86400 })
         const existing = await env.ARCANA_PROXY.get(`balance:${email}`, "json") as any
         const current = existing?.credits ?? 0
         await env.ARCANA_PROXY.put(`balance:${email}`, JSON.stringify({ credits: current + SUBSCRIPTION_CREDITS, updatedAt: Date.now() }))
@@ -559,6 +573,19 @@ function generateLicenseKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32))
   const b64 = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
   return `ARCANA-PRO-${b64}`
+}
+
+async function handleValidateEmail(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  try {
+    const url = new URL(request.url)
+    const email = url.searchParams.get("email")?.trim().toLowerCase()
+    if (!email) return json({ valid: false, error: "missing_email" }, 400, cors)
+    const idx = await env.ARCANA_PROXY.get(`email_account:${email}`, "json") as any
+    if (!idx) return json({ valid: false, message: "No account found for this email" }, 404, cors)
+    return json({ valid: true, tier: idx.tier, created: idx.createdAt }, 200, cors)
+  } catch (e) {
+    return json({ valid: false, error: "lookup_error" }, 500, cors)
+  }
 }
 
 async function handleSetupPlans(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
