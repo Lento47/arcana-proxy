@@ -144,8 +144,11 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
       body: JSON.stringify({ licenseKey: key, machineId: `proxy-${key.slice(0, 8)}` }),
       signal: AbortSignal.timeout(5000),
     })
-    const data = await res.json() as any
-    if (data.valid) {
+    const body = await res.json() as any
+    // The license server signs responses as { data, signature }; unsigned
+    // deployments return the payload flat. Handle both shapes.
+    const data = body?.data ?? body
+    if (data?.valid) {
       user = { id: key.slice(0, 12), tier: data.tier ?? "free" }
       await kv.put(`license:${key}`, JSON.stringify(user))
       licenseCache.set(key, user)
