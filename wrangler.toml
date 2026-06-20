@@ -1,3 +1,9 @@
+# ---------------------------------------------------------------------------
+# NOTE: Zone IDs and KV namespace IDs are hardcoded for manual deploys.
+# These should eventually be managed via CI/CD secrets / environment-specific
+# wrangler.toml generation instead of committed values.
+# ---------------------------------------------------------------------------
+
 name = "arcana-proxy"
 main = "src/index.ts"
 compatibility_date = "2026-06-01"
@@ -23,9 +29,19 @@ name = "EMAIL"
 #   npx wrangler deploy --env staging
 #   npx wrangler secret put --env staging PAYPAL_CLIENT_ID
 #   npx wrangler secret put --env staging PAYPAL_CLIENT_SECRET
+#
+# WARNING: Staging shares the same KV namespace as production
+# (`id = "8c183296c8a14bd6857b1c896e7e5c3c"`). All staging KV keys will
+# collide with production keys. To avoid this:
+#   - Create a separate staging KV namespace (recommended once you have
+#     access to create new namespaces), OR
+#   - Use a `staging:` key prefix in staging code paths.
+# The KV namespace ID to use for a dedicated staging namespace once created:
+#   staging_kv_id = "<create-and-insert-id-here>"
 # ---------------------------------------------------------------------------
 [env.staging]
 workers_dev = true
+routes = []
 
 [env.staging.vars]
 PAYPAL_SANDBOX = "true"

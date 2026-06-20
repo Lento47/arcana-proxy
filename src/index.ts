@@ -13,6 +13,7 @@ interface Env {
   EMAIL?: SendEmail
   TRIAL_ENABLED?: string
   MERCHANT_ID?: string
+  PAYPAL_WEBHOOK_ID?: string
 }
 
 const TRIAL_DURATION_MS = 14 * 24 * 60 * 60 * 1000
@@ -68,11 +69,6 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (key.startsWith("ARCANA-DEV-")) { user = { id: "Arcana Developer", tier: "enterprise" }; licenseCache.set(key, user); return user }
   const account = await kv.get(`account:${key}`, "json") as any
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
-  // Email-based lookup (subscription users): token is an email address
-  if (key.includes("@")) {
-    const idx = await kv.get(`email_account:${key.toLowerCase()}`, "json") as any
-    if (idx) { user = { id: key.toLowerCase(), tier: idx.tier ?? "pro" }; licenseCache.set(key, user); return user }
-  }
   // Fallback: validate against license server (handles cross-KV namespace)
   try {
     const res = await fetch(`https://api.arcana.otnelhq.com/api/license/validate`, {
@@ -150,12 +146,22 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
+    const origin = request.headers.get("Origin") || ""
+    const allowedOrigin = origin === "https://arcana.otnelhq.com" || /^https?://localhost(:d+)?$/.test(origin)
+      ? origin
+      : "https://arcana.otnelhq.com"
     const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     }
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders })
+
+    // Reject request bodies larger than 1MB
+    const contentLength = request.headers.get("content-length")
+    if (contentLength && parseInt(contentLength) > 1_048_576) {
+      return json({ error: "payload_too_large", message: "Request body exceeds 1MB limit" }, 413, corsHeaders)
+    }
 
     // Periodic cleanup of rate limit maps (every 100 requests instead of setInterval)
     cleanupCounter++
@@ -201,6 +207,8 @@ export default {
           return handleGetBalance(user, env, corsHeaders)
         case "/v1/send-receipt":
           return handleSendTestReceipt(request, env, user, corsHeaders)
+        case "/v1/auth/resolve-email":
+          return handleResolveEmail(request, env, corsHeaders)
         case "/v1/health":
           return json({ status: "ok", service: "arcana-proxy", user: user.id, tier: user.tier }, 200, corsHeaders)
         default:
@@ -221,12 +229,20 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   const maxCost = estimateCost(body.model, Math.min(inputTokens, 128000), 2000)
   const margin = 1.4
 
-  // Acquire lock to prevent race conditions on balance
+  // Acquire lock to prevent race conditions on balance — nonce-based CAS removes TOCTOU
   const lockKey = `lock:${user.id}`
-  const locked = await env.ARCANA_PROXY.get(lockKey)
-  if (locked && user.tier !== "enterprise") return json({ error: "too_many_requests", message: "A previous request is still processing." }, 429, cors)
-  await env.ARCANA_PROXY.put(lockKey, "1", { expirationTtl: 60 })
-  const releaseLock = () => env.ARCANA_PROXY.delete(lockKey).catch(() => {})
+  const lockValue = crypto.randomUUID()
+  await env.ARCANA_PROXY.put(lockKey, lockValue, { expirationTtl: 60 })
+  const currentLock = await env.ARCANA_PROXY.get(lockKey)
+  if (currentLock !== lockValue && user.tier !== "enterprise") {
+    return json({ error: "too_many_requests", message: "A previous request is still processing." }, 429, cors)
+  }
+  const releaseLock = async () => {
+    try {
+      const current = await env.ARCANA_PROXY.get(lockKey)
+      if (current === lockValue) await env.ARCANA_PROXY.delete(lockKey)
+    } catch {}
+  }
 
   try {
     if (user.tier !== "enterprise") {
@@ -252,7 +268,7 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
     if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
     await releaseLock()
     const errorBody = await response.text()
-    return json({ error: "upstream_error", message: errorBody.slice(0, 500) }, response.status, cors)
+    return json({ error: "upstream_error", message: errorBody.slice(0, 100) }, response.status, cors)
   }
 
   const adjustBalance = async (tokensIn: number, tokensOut: number, openRouterCost?: number) => {
@@ -316,12 +332,19 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
   try {
     const body = await request.json() as any
     const amount = Number(body.amount)
-    if (!amount || amount < 5) return json({ error: "Minimum $5" }, 400, cors)
+    // Idempotency check FIRST — before any PayPal API calls
+    const idempotencyKey = request.headers.get("Idempotency-Key")
+    if (idempotencyKey) {
+      const existing = await env.ARCANA_PROXY.get(`idempotent:${idempotencyKey}`, "json") as any
+      if (existing) return json(existing, 200, cors)
+    }
+    if (!isFinite(amount) || amount < 5) return json({ error: "Minimum $5" }, 400, cors)
 
     // Web flow: bind the buyer's identity so we can auto-credit on PayPal return.
     // Primary: email lookup (subscription users). Fallback: license key (non-subscribers).
     // CLI flow omits both and captures explicitly via /v1/pay/capture-order.
     let creditUserId: string | null = null
+    let captureToken: string | null = null
     const email = body.email ? String(body.email).trim().toLowerCase() : null
     if (email) {
       const idx = await env.ARCANA_PROXY.get(`email_account:${email}`, "json") as any
@@ -337,11 +360,12 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
     const base = paypalBase(env)
     const orderPayload: any = { intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "USD", value: amount.toFixed(2) } }] }
     if (creditUserId) {
+      captureToken = crypto.randomUUID()
       orderPayload.application_context = {
         brand_name: "Arcana",
         user_action: "PAY_NOW",
         shipping_preference: "NO_SHIPPING",
-        return_url: "https://arcana.otnelhq.com/credits/return",
+        return_url: `https://arcana.otnelhq.com/credits/return?capture_token=${captureToken}`,
         cancel_url: "https://arcana.otnelhq.com/credits?cancelled=1",
       }
     }
@@ -351,16 +375,9 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
       body: JSON.stringify(orderPayload),
     })
     const order = await orderRes.json() as any
-    if (!order.id) return json({ error: "paypal_error", message: order.message }, 500, cors)
+    if (!order.id) return json({ error: "paypal_error", message: "PayPal order creation failed. Please try again." }, 500, cors)
 
-    // Idempotency key — prevent duplicate orders
-    const idempotencyKey = request.headers.get("Idempotency-Key")
-    if (idempotencyKey) {
-      const existing = await env.ARCANA_PROXY.get(`idempotent:${idempotencyKey}`, "json") as any
-      if (existing) return json(existing, 200, cors)
-    }
-
-    await env.ARCANA_PROXY.put(`purchase:${order.id}`, JSON.stringify({ amount, creditUserId, status: "created" }), { expirationTtl: 86400 })
+    await env.ARCANA_PROXY.put(`purchase:${order.id}`, JSON.stringify({ amount, creditUserId, captureToken, status: "created" }), { expirationTtl: 86400 })
 
     if (idempotencyKey) {
       await env.ARCANA_PROXY.put(`idempotent:${idempotencyKey}`, JSON.stringify({ orderId: order.id }), { expirationTtl: 86400 })
@@ -390,6 +407,12 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
     if (!purchase) return json({ error: "order_not_found" }, 404, cors)
     if (!purchase.creditUserId) return json({ error: "order_not_web", message: "Finish this order with: arcana proxy capture " + orderId }, 400, cors)
 
+    // Verify one-time capture token to prevent order ID enumeration
+    const captureToken = url.searchParams.get("capture_token")
+    if (purchase.captureToken && purchase.captureToken !== captureToken) {
+      return json({ error: "invalid_capture_token" }, 403, cors)
+    }
+
     // Idempotent — already credited
     if (purchase.status === "completed") {
       const bal = await getBalance(purchase.creditUserId, env.ARCANA_PROXY)
@@ -403,10 +426,11 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     })
     const capture = await capRes.json() as any
-    if (capture.status !== "COMPLETED") return json({ error: "payment_not_completed", status: capture.status, message: capture.message }, 400, cors)
+    if (capture.status !== "COMPLETED") return json({ error: "payment_not_completed", status: capture.status, message: "Payment capture failed. Please contact support." }, 400, cors)
 
-    const paid = parseFloat(capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? String(purchase.amount ?? 0))
-    const credits = Math.round(paid * 100)
+    const valueStr = capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? String(purchase.amount ?? "0")
+    const [whole, frac = "00"] = valueStr.split(".")
+    const credits = parseInt(whole) * 100 + parseInt((frac + "00").slice(0, 2))
     const existing = await env.ARCANA_PROXY.get(`balance:${purchase.creditUserId}`, "json") as any
     const newBalance = (existing?.credits ?? 0) + credits
     await env.ARCANA_PROXY.put(`balance:${purchase.creditUserId}`, JSON.stringify({ credits: newBalance, updatedAt: Date.now() }))
@@ -435,7 +459,7 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
     // Double-capture protection
     if (purchase?.status === "completed") return json({ error: "order_already_captured" }, 400, cors)
     // If the order was bound to a buyer at create time, only that buyer (or a dev) may capture it.
-    const isDev = auth?.includes("ARCANA-DEV-") ?? false
+    const isDev = auth?.startsWith("Bearer ARCANA-DEV-") ?? false
     if (purchase?.creditUserId && purchase.creditUserId !== caller.id && !isDev) {
       return json({ error: "forbidden" }, 403, cors)
     }
@@ -450,8 +474,10 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
     const capture = await captureRes.json() as any
     if (capture.status !== "COMPLETED") return json({ error: "payment_not_completed", status: capture.status }, 400, cors)
 
-    const amount = parseFloat(capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? String(purchase?.amount ?? "0"))
-    const credits = Math.round(amount * 100)
+    const valueStr = capture.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ?? String(purchase?.amount ?? "0")
+    const amount = parseFloat(valueStr)
+    const [whole, frac = "00"] = valueStr.split(".")
+    const credits = parseInt(whole) * 100 + parseInt((frac + "00").slice(0, 2))
     const existing = await env.ARCANA_PROXY.get(`balance:${creditTarget}`, "json") as any
     const currentCredits = existing?.credits ?? 0
     await env.ARCANA_PROXY.put(`balance:${creditTarget}`, JSON.stringify({ credits: currentCredits + credits, updatedAt: Date.now() }))
@@ -463,7 +489,7 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
 
     // Abuse detection: flag if same IP creates multiple orders rapidly
     const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
-    const orderCount = await env.ARCANA_PROXY.get(`abuse:orders:${clientIp}:${Date.now() / 60000}`, "json") as any ?? 0
+    const orderCount = await env.ARCANA_PROXY.get(`abuse:orders:${clientIp}:${Math.floor(Date.now() / 60000)}`, "json") as any ?? 0
     await env.ARCANA_PROXY.put(`abuse:orders:${clientIp}:${Math.floor(Date.now() / 60000)}`, JSON.stringify(orderCount + 1), { expirationTtl: 120 })
 
     return json({ success: true, creditsAdded: credits, newBalance: currentCredits + credits }, 200, cors)
@@ -474,9 +500,42 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
 
 async function handlePayPalWebhook(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
   try {
-    const body = await request.json() as any
+    const rawBody = await request.text()
+    const body = JSON.parse(rawBody)
     const eventType = body.event_type
     const resource = body.resource ?? {}
+
+    // PayPal webhook signature verification
+    const transmissionId = request.headers.get("PAYPAL-TRANSMISSION-ID")
+    const transmissionTime = request.headers.get("PAYPAL-TRANSMISSION-TIME")
+    const transmissionSig = request.headers.get("PAYPAL-TRANSMISSION-SIG")
+    const certUrl = request.headers.get("PAYPAL-CERT-URL")
+    const webhookId = env.PAYPAL_WEBHOOK_ID
+
+    if (transmissionId && transmissionTime && transmissionSig && certUrl && webhookId) {
+      const authAlgo = request.headers.get("PAYPAL-AUTH-ALGO") ?? ""
+      const token = await getPayPalToken(env)
+      const verifyRes = await fetch(`${paypalBase(env)}/v1/notifications/verify-webhook-signature`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          auth_algo: authAlgo,
+          cert_url: certUrl,
+          transmission_id: transmissionId,
+          transmission_sig: transmissionSig,
+          transmission_time: transmissionTime,
+          webhook_id: webhookId,
+          webhook_event: body,
+        }),
+      })
+      const verifyData = await verifyRes.json() as any
+      if (verifyData.verification_status !== "SUCCESS") {
+        return json({ error: "webhook_verification_failed", status: verifyData.verification_status }, 403, cors)
+      }
+    } else {
+      // Headers or webhook ID missing — skip verification for backward compatibility
+      console?.warn?.("PayPal webhook verification skipped: missing headers or PAYPAL_WEBHOOK_ID")
+    }
 
     switch (eventType) {
       case "BILLING.SUBSCRIPTION.ACTIVATED": {
@@ -588,9 +647,20 @@ async function handleValidateEmail(request: Request, env: Env, cors: Record<stri
   }
 }
 
+// Authenticated email resolution — lets a logged-in user recover their license key(s)
+// The email_account index is maintained for subscription lookup but NEVER used for authentication.
+async function handleResolveEmail(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const url = new URL(request.url)
+  const email = url.searchParams.get("email")?.trim().toLowerCase()
+  if (!email) return json({ error: "missing_email" }, 400, cors)
+  const idx = await env.ARCANA_PROXY.get(`email_account:${email}`, "json") as any
+  if (!idx) return json({ error: "email_not_found" }, 404, cors)
+  return json({ email, licenseKey: idx.licenseKey, subId: idx.subId, tier: idx.tier, createdAt: idx.createdAt }, 200, cors)
+}
+
 async function handleSetupPlans(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
   const auth = request.headers.get("Authorization")
-  if (!auth?.includes("ARCANA-DEV-")) return json({ error: "unauthorized" }, 401, cors)
+  if (!auth?.startsWith("Bearer ARCANA-DEV-")) return json({ error: "unauthorized" }, 401, cors)
   try {
     const token = await getPayPalToken(env)
     const base = paypalBase(env)
@@ -602,7 +672,7 @@ async function handleSetupPlans(request: Request, env: Env, cors: Record<string,
       body: JSON.stringify({ name: "Arcana Pro", type: "SERVICE", description: "Arcana AI agent — Pro subscription" }),
     })
     const product = await productRes.json() as any
-    if (!product.id) return json({ error: "product_creation_failed", message: product.message }, 500, cors)
+    if (!product.id) return json({ error: "product_creation_failed", message: "PayPal product creation failed. Please try again." }, 500, cors)
     const productId = product.id
 
     // Create billing plan
@@ -628,7 +698,7 @@ async function handleSetupPlans(request: Request, env: Env, cors: Record<string,
       }),
     })
     const plan = await planRes.json() as any
-    if (!plan.id) return json({ error: "plan_creation_failed", message: plan.message }, 500, cors)
+    if (!plan.id) return json({ error: "plan_creation_failed", message: "PayPal plan creation failed. Please try again." }, 500, cors)
 
     // Store monthly plan in KV
     await env.ARCANA_PROXY.put("plan:pro_monthly", JSON.stringify({ productId, planId: plan.id, price: 19, tier: "pro", interval: "MONTH" }))
@@ -656,7 +726,7 @@ async function handleSetupPlans(request: Request, env: Env, cors: Record<string,
       }),
     })
     const yearly = await yearlyRes.json() as any
-    if (!yearly.id) return json({ error: "yearly_plan_creation_failed", message: yearly.message }, 500, cors)
+    if (!yearly.id) return json({ error: "yearly_plan_creation_failed", message: "PayPal yearly plan creation failed. Please try again." }, 500, cors)
     await env.ARCANA_PROXY.put("plan:pro_yearly", JSON.stringify({ productId, planId: yearly.id, price: 190, tier: "pro", interval: "YEAR" }))
 
     return json({ productId, monthlyPlanId: plan.id, yearlyPlanId: yearly.id }, 200, cors)
@@ -691,7 +761,7 @@ async function handleCreateSub(request: Request, env: Env, cors: Record<string, 
       }),
     })
     const sub = await subRes.json() as any
-    if (!sub.id) return json({ error: "subscription_creation_failed", message: sub.message }, 500, cors)
+    if (!sub.id) return json({ error: "subscription_creation_failed", message: "Subscription creation failed. Please try again." }, 500, cors)
 
     // Store pending subscription
     await env.ARCANA_PROXY.put(`sub_pending:${sub.id}`, JSON.stringify({ plan: planKey, createdAt: Date.now(), status: "pending" }), { expirationTtl: 3600 })
@@ -852,7 +922,8 @@ async function handleGetBalance(user: { id: string }, env: Env, cors: Record<str
 async function handleSendTestReceipt(request: Request, env: Env, user: { id: string }, cors: Record<string, string>): Promise<Response> {
   if (!env.EMAIL) return json({ error: "email_service_not_configured" }, 503, cors)
   const body = await request.json().catch(() => ({})) as any
-  const to = body.email || "lejzerv@gmail.com"
+  const to = body.email
+  if (!to) return json({ error: "email_required" }, 400, cors)
   const amount = body.amount ?? 10
   const credits = body.credits ?? amount * 100
   const transactionId = body.transactionId ?? "txn_test_" + Date.now().toString(36)
@@ -875,7 +946,7 @@ async function handleSendTestReceipt(request: Request, env: Env, user: { id: str
     })
     return json({ sent: true, messageId: r.messageId, to, amount, credits, transactionId }, 200, cors)
   } catch (e: any) {
-    return json({ error: "send_failed", message: e.message, code: e.code }, 500, cors)
+    return json({ error: "send_failed" }, 500, cors)
   }
 }
 
