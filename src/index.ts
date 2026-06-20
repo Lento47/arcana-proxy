@@ -15,6 +15,7 @@ interface Env {
   TRIAL_ENABLED?: string
   MERCHANT_ID?: string
   PAYPAL_WEBHOOK_ID?: string
+  ARCANA_ADMIN_KEY?: string
 }
 
 // --- OpenRouter API key pool (rotation + rate-limit cooldown) ---
@@ -124,7 +125,6 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (user) return user
   const raw = await kv.get(`license:${key}`, "json") as any
   if (raw) { licenseCache.set(key, raw); return raw }
-  if (key.startsWith("ARCANA-DEV-")) { user = { id: "Arcana Developer", tier: "enterprise" }; licenseCache.set(key, user); return user }
   const account = await kv.get(`account:${key}`, "json") as any
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
   // Fallback: validate against license server (handles cross-KV namespace)
@@ -521,8 +521,7 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
     // Double-capture protection
     if (purchase?.status === "completed") return json({ error: "order_already_captured" }, 400, cors)
     // If the order was bound to a buyer at create time, only that buyer (or a dev) may capture it.
-    const isDev = auth?.startsWith("Bearer ARCANA-DEV-") ?? false
-    if (purchase?.creditUserId && purchase.creditUserId !== caller.id && !isDev) {
+    if (purchase?.creditUserId && purchase.creditUserId !== caller.id) {
       return json({ error: "forbidden" }, 403, cors)
     }
     const creditTarget = purchase?.creditUserId ?? caller.id
@@ -722,7 +721,8 @@ async function handleResolveEmail(request: Request, env: Env, cors: Record<strin
 
 async function handleSetupPlans(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
   const auth = request.headers.get("Authorization")
-  if (!auth?.startsWith("Bearer ARCANA-DEV-")) return json({ error: "unauthorized" }, 401, cors)
+  const adminKey = env.ARCANA_ADMIN_KEY
+  if (!adminKey || auth !== `Bearer ${adminKey}`) return json({ error: "unauthorized" }, 401, cors)
   try {
     const token = await getPayPalToken(env)
     const base = paypalBase(env)
