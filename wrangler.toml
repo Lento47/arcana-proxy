@@ -14,3 +14,6 @@ id = "8c183296c8a14bd6857b1c896e7e5c3c"
 [[analytics_engine_datasets]]
 binding = "ARCANA_PROXY_ANALYTICS"
 dataset = "arcana_proxy_usage"
+
+[[send_email]]
+name = "EMAIL"
