@@ -205,7 +205,7 @@ export default {
     const url = new URL(request.url)
     const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
     const origin = request.headers.get("Origin") || ""
-    const allowedOrigin = origin === "https://arcana.otnelhq.com" || /^https?://localhost(:d+)?$/.test(origin)
+    const allowedOrigin = origin === "https://arcana.otnelhq.com" || /^https?:\/\/localhost(:\d+)?$/.test(origin)
       ? origin
       : "https://arcana.otnelhq.com"
     const corsHeaders = {
