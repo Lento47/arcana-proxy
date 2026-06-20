@@ -5,7 +5,8 @@ const PAYPAL_LIVE = "https://api-m.paypal.com"
 const PAYPAL_SANDBOX = "https://api-m.sandbox.paypal.com"
 
 interface Env {
-  OPENROUTER_KEY: string
+  OPENROUTER_KEY?: string
+  OPENROUTER_KEYS?: string       // comma-separated pool of API keys for rotation
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
   ARCANA_PROXY: KVNamespace
@@ -15,6 +16,63 @@ interface Env {
   MERCHANT_ID?: string
   PAYPAL_WEBHOOK_ID?: string
 }
+
+// --- OpenRouter API key pool (rotation + rate-limit cooldown) ---
+interface KeyState {
+  key: string
+  cooldownUntil: number
+  failures: number
+}
+let keyPool: KeyState[] = []
+let keyPoolIndex = 0
+const KEY_COOLDOWN_MS = 30000      // 30s after rate-limit or auth error
+const KEY_MAX_FAILURES = 3          // eject key after 3 consecutive failures
+
+function initKeyPool(env: Env): KeyState[] {
+  if (keyPool.length > 0) return keyPool
+  const raw = env.OPENROUTER_KEYS || env.OPENROUTER_KEY || ""
+  const keys = raw.split(",").map(k => k.trim()).filter(Boolean)
+  if (keys.length === 0) return []
+  keyPool = keys.map(k => ({ key: k, cooldownUntil: 0, failures: 0 }))
+  return keyPool
+}
+
+function getOpenRouterKey(env: Env): string | null {
+  const pool = initKeyPool(env)
+  if (pool.length === 0) return null
+  const now = Date.now()
+  // Try round-robin, skipping keys in cooldown
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (keyPoolIndex + i) % pool.length
+    const ks = pool[idx]
+    if (now >= ks.cooldownUntil) {
+      keyPoolIndex = (idx + 1) % pool.length
+      return ks.key
+    }
+  }
+  // All keys in cooldown — return the one with earliest recovery
+  const best = pool.reduce((a, b) => a.cooldownUntil < b.cooldownUntil ? a : b)
+  return best.key
+}
+
+function markKeyRateLimited(key: string): void {
+  const ks = keyPool.find(k => k.key === key)
+  if (!ks) return
+  const now = Date.now()
+  ks.failures++
+  // Exponential backoff: 30s, 60s, 120s
+  const backoff = KEY_COOLDOWN_MS * Math.pow(2, Math.min(ks.failures - 1, 3))
+  ks.cooldownUntil = now + backoff
+  if (ks.failures >= KEY_MAX_FAILURES) {
+    ks.cooldownUntil = now + 5 * 60 * 1000  // 5-minute hard cooldown
+  }
+}
+
+function markKeySuccess(key: string): void {
+  const ks = keyPool.find(k => k.key === key)
+  if (ks) ks.failures = 0
+}
+// --- end key pool ---
 
 const TRIAL_DURATION_MS = 14 * 24 * 60 * 60 * 1000
 const SUBSCRIPTION_CREDITS = 500 // $5 worth of credits bundled with Pro
@@ -252,9 +310,11 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
     }
   } catch { await releaseLock(); throw new Error("lock error") }
 
+  const openRouterKey = getOpenRouterKey(env)
+  if (!openRouterKey) { await releaseLock(); return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors) }
   const headers = new Headers({
     "Content-Type": "application/json",
-    Authorization: `Bearer ${env.OPENROUTER_KEY}`,
+    Authorization: `Bearer ${openRouterKey}`,
     "HTTP-Referer": "https://arcana.otnelhq.com",
     "X-Title": "arcana",
   })
@@ -265,11 +325,13 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   const response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(body) })
 
   if (!response.ok) {
+    if (response.status === 429 || response.status === 401) markKeyRateLimited(openRouterKey)
     if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
     await releaseLock()
     const errorBody = await response.text()
     return json({ error: "upstream_error", message: errorBody.slice(0, 100) }, response.status, cors)
   }
+  markKeySuccess(openRouterKey)
 
   const adjustBalance = async (tokensIn: number, tokensOut: number, openRouterCost?: number) => {
     const actualCost = openRouterCost ?? estimateCost(body.model, tokensIn, tokensOut)
@@ -951,7 +1013,11 @@ async function handleSendTestReceipt(request: Request, env: Env, user: { id: str
 }
 
 async function listModels(env: Env, cors: Record<string, string>): Promise<Response> {
-  const response = await fetch(`${OPENROUTER_URL}/v1/models`, { headers: { Authorization: `Bearer ${env.OPENROUTER_KEY}` } })
+  const key = getOpenRouterKey(env)
+  if (!key) return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors)
+  const response = await fetch(`${OPENROUTER_URL}/v1/models`, { headers: { Authorization: `Bearer ${key}` } })
+  if (response.ok) markKeySuccess(key)
+  else if (response.status === 429 || response.status === 401) markKeyRateLimited(key)
   const data = await response.json()
   return json(data, response.status, cors)
 }
