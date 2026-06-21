@@ -101,6 +101,30 @@ const IP_RATE_LIMIT = 50
 const USER_RATE_LIMIT = 25
 const RATE_WINDOW = 60000
 
+// Daily usage limits by tier
+const DAILY_LIMITS: Record<string, number> = {
+  free: 50,
+  trial: 200,
+  pro: 2000,
+  team: 5000,
+  enterprise: Infinity,
+}
+
+async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): Promise<{ allowed: boolean; remaining: number }> {
+  const limit = DAILY_LIMITS[tier] ?? DAILY_LIMITS.free
+  if (limit === Infinity) return { allowed: true, remaining: Infinity }
+  const date = new Date().toISOString().split("T")[0]!
+  const key = `usage:daily:${userId}:${date}`
+  const current = parseInt((await kv.get(key)) ?? "0")
+  if (current >= limit) return { allowed: false, remaining: 0 }
+  const remaining = limit - current - 1
+  // Increment in background (fire-and-forget, TTL to midnight UTC)
+  const now = Date.now()
+  const midnight = new Date(date + "T23:59:59Z").getTime()
+  kv.put(key, String(current + 1), { expirationTtl: Math.ceil((midnight - now) / 1000) })
+  return { allowed: true, remaining }
+}
+
 // License cache
 let cleanupCounter = 0
 let licenseCache: Map<string, { id: string; tier: string }> | null = null
@@ -297,9 +321,27 @@ export default {
       const user = await getUser(request.headers.get("Authorization"), env.ARCANA_PROXY, ctx, env)
       if (!user) return json({ error: "unauthorized" }, 401, corsHeaders)
 
-      // User rate limiting
+      // User rate limiting (per-minute)
       const userRl = checkRateLimit(user.id, userLimits, USER_RATE_LIMIT)
       if (!userRl.allowed) return json({ error: "rate_limited", message: "25 req/min per user" }, 429, corsHeaders)
+
+      // Daily usage limit (per-tier)
+      if (user.tier !== "enterprise") {
+        const daily = await checkDailyLimit(user.id, user.tier, env.ARCANA_PROXY)
+        if (!daily.allowed) {
+          return json({
+            error: "daily_limit_reached",
+            message: user.tier === "free"
+              ? "Daily limit reached (50 requests). Upgrade to Pro for 2,000/day."
+              : "Daily limit reached. Upgrade your plan for more capacity.",
+            remaining: 0,
+          }, 429, corsHeaders)
+        }
+        // Add remaining quota to response headers for all requests below
+        if (daily.remaining < 50) {
+          corsHeaders["X-RateLimit-Remaining"] = String(daily.remaining)
+        }
+      }
 
       switch (url.pathname) {
         case "/v1/chat/completions":
