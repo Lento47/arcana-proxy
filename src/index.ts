@@ -308,7 +308,7 @@ export default {
         case "/v1/models":
           return listModels(env, corsHeaders)
         case "/v1/usage":
-          return getUserUsage(user, corsHeaders)
+          return getUserUsage(user, env, corsHeaders)
         case "/v1/balance":
           return handleGetBalance(user, env, corsHeaders)
         case "/v1/send-receipt":
@@ -475,7 +475,7 @@ async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionConte
         brand_name: "Arcana",
         user_action: "PAY_NOW",
         shipping_preference: "NO_SHIPPING",
-        return_url: `https://arcana.otnelhq.com/credits/return?capture_token=${captureToken}`,
+        return_url: `https://arcana.otnelhq.com/credits/return?token=${order.id}&capture_token=${captureToken}`,
         cancel_url: "https://arcana.otnelhq.com/credits?cancelled=1",
       }
     }
@@ -1084,7 +1084,7 @@ async function listModels(env: Env, cors: Record<string, string>): Promise<Respo
   return json(data, response.status, cors)
 }
 
-async function getUserUsage(user: { id: string }, cors: Record<string, string>): Promise<Response> {
+async function getUserUsage(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   const date = new Date().toISOString().split("T")[0]!
   const key = `usage:${user.id}:${date}`
   const data = await env.ARCANA_PROXY.get(key, "json") as any ?? {}
