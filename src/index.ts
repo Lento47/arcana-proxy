@@ -193,14 +193,25 @@ function checkRateLimit(key: string, map: Map<string, { count: number; resetAt: 
 }
 
 async function getPayPalToken(env: Env): Promise<string> {
+  const mode = env.PAYPAL_SANDBOX === "true" ? "sandbox" : "live"
   const base = env.PAYPAL_SANDBOX === "true" ? PAYPAL_SANDBOX : PAYPAL_LIVE
+  if (!env.PAYPAL_CLIENT_ID || !env.PAYPAL_CLIENT_SECRET) {
+    throw new Error(`paypal token: missing PAYPAL_CLIENT_ID/SECRET (mode=${mode})`)
+  }
   const auth = btoa(`${env.PAYPAL_CLIENT_ID}:${env.PAYPAL_CLIENT_SECRET}`)
   const res = await fetch(`${base}/v1/oauth2/token`, {
     method: "POST",
     headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
     body: "grant_type=client_credentials",
   })
-  const data = await res.json() as any
+  const data = (await res.json()) as any
+  if (!data.access_token) {
+    // Surface the real cause (e.g. invalid_client = sandbox creds against the live
+    // endpoint, or a wrong secret). Credentials themselves are never logged.
+    throw new Error(
+      `paypal token failed (HTTP ${res.status}, mode=${mode}): ${data.error ?? ""} ${data.error_description ?? ""}`.trim(),
+    )
+  }
   return data.access_token
 }
 
@@ -273,8 +284,8 @@ export default {
     try {
       // Public endpoints (IP rate limit only)
       if (url.pathname === "/v1/identity/validate-email") return handleValidateEmail(request, env, corsHeaders)
-      if (url.pathname === "/v1/pay/create-order") return handleCreateOrder(request, env, corsHeaders)
-      if (url.pathname === "/v1/pay/capture-order") return handleCaptureOrder(request, env, corsHeaders)
+      if (url.pathname === "/v1/pay/create-order") return handleCreateOrder(request, env, ctx, corsHeaders)
+      if (url.pathname === "/v1/pay/capture-order") return handleCaptureOrder(request, env, ctx, corsHeaders)
       if (url.pathname === "/v1/pay/capture-return") return handleCaptureReturn(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/webhook") return handlePayPalWebhook(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/setup-plans") return handleSetupPlans(request, env, corsHeaders)
@@ -427,7 +438,7 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
   } catch { return null }
 }
 
-async function handleCreateOrder(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json() as any
     const amount = Number(body.amount)
@@ -474,7 +485,16 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
       body: JSON.stringify(orderPayload),
     })
     const order = await orderRes.json() as any
-    if (!order.id) return json({ error: "paypal_error", message: "PayPal order creation failed. Please try again." }, 500, cors)
+    if (!order.id) {
+      const detail =
+        order?.message ?? order?.error_description ?? order?.name ?? JSON.stringify(order).slice(0, 200)
+      console.error("paypal create-order failed", { status: orderRes.status, detail })
+      return json(
+        { error: "paypal_error", message: `PayPal order failed (HTTP ${orderRes.status}): ${detail}` },
+        500,
+        cors,
+      )
+    }
 
     await env.ARCANA_PROXY.put(`purchase:${order.id}`, JSON.stringify({ amount, creditUserId, captureToken, status: "created" }), { expirationTtl: 86400 })
 
@@ -485,7 +505,9 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
     const approvalUrl = order.links?.find((l: any) => l.rel === "approve")?.href
     return json({ orderId: order.id, approvalUrl }, 200, cors)
   } catch (e) {
-    return json({ error: "paypal_error" }, 500, cors)
+    const message = e instanceof Error ? e.message : String(e)
+    console.error("paypal create-order exception", { message })
+    return json({ error: "paypal_error", message }, 500, cors)
   }
 }
 
@@ -541,7 +563,7 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
   }
 }
 
-async function handleCaptureOrder(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+async function handleCaptureOrder(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json() as any
     const { orderId } = body
