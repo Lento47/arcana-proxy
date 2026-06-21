@@ -835,6 +835,9 @@ async function handleSetupPlans(request: Request, env: Env, cors: Record<string,
 }
 
 async function handleCreateSub(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const origin = request.headers.get("Origin") || ""
+  const allowed = origin === "https://arcana.otnelhq.com" || /^https?:\/\/localhost(:\d+)?$/.test(origin)
+  if (!allowed) return json({ error: "forbidden", message: "Requests must come from arcana.otnelhq.com" }, 403, cors)
   try {
     const body = await request.json().catch(() => ({})) as any
     const planKey = body.plan ?? "pro_monthly"
