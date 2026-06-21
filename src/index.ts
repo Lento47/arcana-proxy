@@ -10,12 +10,14 @@ interface Env {
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
   ARCANA_PROXY: KVNamespace
+  ARCANA_LICENSE: KVNamespace
   ARCANA_PROXY_ANALYTICS?: AnalyticsEngineDataset
   EMAIL?: SendEmail
   TRIAL_ENABLED?: string
   MERCHANT_ID?: string
   PAYPAL_WEBHOOK_ID?: string
   ARCANA_ADMIN_KEY?: string
+  ARCANA_ADMIN_KEYS?: string
 }
 
 // --- OpenRouter API key pool (rotation + rate-limit cooldown) ---
@@ -105,7 +107,7 @@ let licenseCache: Map<string, { id: string; tier: string }> | null = null
 let licenseCacheTime = 0
 const LICENSE_CACHE_TTL = 300000
 
-async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise<{ id: string; tier: string } | null> {
+async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionContext, env?: Env): Promise<{ id: string; tier: string } | null> {
   if (!auth || !auth.startsWith("Bearer ")) return null
   const key = auth.slice(7).trim()
   if (!key) return null
@@ -125,9 +127,25 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (user) return user
   const raw = await kv.get(`license:${key}`, "json") as any
   if (raw) { licenseCache.set(key, raw); return raw }
-  // Configurable admin keys (ARCANA_ADMIN_KEYS=key1,key2,...) — enterprise tier
-  if (env?.ARCANA_ADMIN_KEYS) {
-    const adminKeys = env.ARCANA_ADMIN_KEYS.split(",").map(k => k.trim()).filter(Boolean)
+  // Check Workers Cache API — globally replicated, sub-10ms reads.
+  // Avoids KV eventual-consistency gap and license server cold starts.
+  {
+    const cache = caches.default
+    const cacheUrl = `https://arcana-proxy/license/${encodeURIComponent(key)}`
+    const cached = await cache.match(cacheUrl)
+    if (cached) {
+      user = await cached.json() as { id: string; tier: string }
+      licenseCache.set(key, user)
+      // Also backfill KV so it's available after cache expiry
+      ctx.waitUntil(kv.put(`license:${key}`, JSON.stringify(user)))
+      return user
+    }
+  }
+  // Configurable admin keys — enterprise tier. Accepts both singular
+  // (ARCANA_ADMIN_KEY) and plural (ARCANA_ADMIN_KEYS) env var names.
+  if (env?.ARCANA_ADMIN_KEYS || env?.ARCANA_ADMIN_KEY) {
+    const raw = (env.ARCANA_ADMIN_KEYS || env.ARCANA_ADMIN_KEY)!
+    const adminKeys = raw.split(",").map(k => k.trim()).filter(Boolean)
     if (adminKeys.includes(key)) {
       user = { id: "Admin", tier: "enterprise" }
       licenseCache.set(key, user)
@@ -138,7 +156,7 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
   // Fallback: validate against license server (handles cross-KV namespace)
   try {
-    const res = await fetch(`https://api.arcana.otnelhq.com/api/license/validate`, {
+    const res = await fetch(`https://arcana-license-server.lejzerv.workers.dev/api/license/validate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ licenseKey: key, machineId: `proxy-${key.slice(0, 8)}` }),
@@ -150,8 +168,15 @@ async function getUser(auth: string | null, kv: KVNamespace, env?: Env): Promise
     const data = body?.data ?? body
     if (data?.valid) {
       user = { id: key.slice(0, 12), tier: data.tier ?? "free" }
-      await kv.put(`license:${key}`, JSON.stringify(user))
+      // Cache immediately so subsequent requests in this isolate are fast.
       licenseCache.set(key, user)
+      // KV for cross-region persistence (eventually consistent).
+      ctx.waitUntil(kv.put(`license:${key}`, JSON.stringify(user)))
+      // Cache API for instant global reads — bypasses KV inconsistency.
+      const cacheUrl = `https://arcana-proxy/license/${encodeURIComponent(key)}`
+      const res = new Response(JSON.stringify(user))
+      res.headers.set("Cache-Control", "max-age=86400")
+      ctx.waitUntil(caches.default.put(cacheUrl, res))
       return user
     }
   } catch {}
@@ -213,7 +238,7 @@ async function deductBalance(userId: string, cost: number, kv: KVNamespace): Pro
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
     const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
     const origin = request.headers.get("Origin") || ""
@@ -258,7 +283,7 @@ export default {
       if (url.pathname === "/v1/trial/start") return handleTrialStart(request, env, corsHeaders)
 
       // Auth required
-      const user = await getUser(request.headers.get("Authorization"), env.ARCANA_PROXY, env)
+      const user = await getUser(request.headers.get("Authorization"), env.ARCANA_PROXY, ctx, env)
       if (!user) return json({ error: "unauthorized" }, 401, corsHeaders)
 
       // User rate limiting
@@ -425,7 +450,7 @@ async function handleCreateOrder(request: Request, env: Env, cors: Record<string
       if (!idx) return json({ error: "invalid_email", message: "Email not found. Subscribe first or use a license key." }, 400, cors)
       creditUserId = email // balance:${email} is the canonical balance key for subscribers
     } else if (body.userId) {
-      const buyer = await getUser(`Bearer ${String(body.userId).trim()}`, env.ARCANA_PROXY, env)
+      const buyer = await getUser(`Bearer ${String(body.userId).trim()}`, env.ARCANA_PROXY, ctx, env)
       if (!buyer) return json({ error: "invalid_key", message: "Arcana key not recognized. Use your email or license key." }, 400, cors)
       creditUserId = buyer.id
     }
@@ -526,7 +551,7 @@ async function handleCaptureOrder(request: Request, env: Env, cors: Record<strin
     // (the same identity /v1/balance and the subscription webhook use), so any real
     // license key works — not just ARCANA-DEV keys. Body userId is no longer trusted.
     const auth = request.headers.get("Authorization")
-    const caller = await getUser(auth, env.ARCANA_PROXY, env)
+    const caller = await getUser(auth, env.ARCANA_PROXY, ctx, env)
     if (!caller) return json({ error: "unauthorized" }, 401, cors)
 
     const purchase = await env.ARCANA_PROXY.get(`purchase:${orderId}`, "json") as any

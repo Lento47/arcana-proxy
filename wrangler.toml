@@ -17,6 +17,10 @@ routes = [
 binding = "ARCANA_PROXY"
 id = "8c183296c8a14bd6857b1c896e7e5c3c"
 
+[[kv_namespaces]]
+binding = "ARCANA_LICENSE"
+id = "63e54bc7b2e8405cb4db5d926e1f2685"
+
 [[analytics_engine_datasets]]
 binding = "ARCANA_PROXY_ANALYTICS"
 dataset = "arcana_proxy_usage"
