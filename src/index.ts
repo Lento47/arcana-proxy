@@ -131,6 +131,51 @@ let licenseCache: Map<string, { id: string; tier: string }> | null = null
 let licenseCacheTime = 0
 const LICENSE_CACHE_TTL = 300000
 
+// Supabase JWT verification
+const SUPABASE_JWKS_URL = "https://ndaejikkbckaeygtruwl.supabase.co/.well-known/jwks.json"
+let jwksCache: { keys: any[] } | null = null
+let jwksCacheTime = 0
+const JWKS_CACHE_TTL = 3_600_000
+let ecdsaKeyCache: { kid: string; key: CryptoKey } | null = null
+
+function base64urlDecode(str: string): Uint8Array {
+  str = str.replace(/-/g, "+").replace(/_/g, "/")
+  while (str.length % 4) str += "="
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0))
+}
+
+async function verifySupabaseJWT(token: string): Promise<{ sub: string; email: string } | null> {
+  if (!token.startsWith("eyJ")) return null
+  const parts = token.split(".")
+  if (parts.length !== 3) return null
+  let header: any
+  try { header = JSON.parse(atob(parts[0])) } catch { return null }
+  if (header.alg !== "ES256") return null
+  const now = Date.now()
+  if (!jwksCache || now - jwksCacheTime > JWKS_CACHE_TTL) {
+    const r = await fetch(SUPABASE_JWKS_URL)
+    if (!r.ok) return null
+    jwksCache = await r.json() as any
+    jwksCacheTime = now
+    ecdsaKeyCache = null
+  }
+  const jwk = jwksCache.keys.find((k: any) => k.kid === header.kid && k.alg === "ES256")
+  if (!jwk) return null
+  if (!ecdsaKeyCache || ecdsaKeyCache.kid !== header.kid) {
+    const key = await crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"])
+    ecdsaKeyCache = { kid: header.kid, key }
+  }
+  const data = new TextEncoder().encode(parts[0] + "." + parts[1])
+  const sig = base64urlDecode(parts[2])
+  const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, ecdsaKeyCache.key, sig, data)
+  if (!valid) return null
+  let payload: any
+  try { payload = JSON.parse(atob(parts[1])) } catch { return null }
+  if (payload.exp && payload.exp * 1000 < now) return null
+  if (payload.aud !== "authenticated") return null
+  return { sub: payload.sub, email: payload.email || "" }
+}
+
 async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionContext, env?: Env): Promise<{ id: string; tier: string } | null> {
   if (!auth || !auth.startsWith("Bearer ")) return null
   const key = auth.slice(7).trim()
@@ -178,6 +223,18 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
   }
   const account = await kv.get(`account:${key}`, "json") as any
   if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
+  // Supabase JWT authentication
+  const jwtUser = await verifySupabaseJWT(key)
+  if (jwtUser) {
+    let sbUser = licenseCache?.get("sb:" + jwtUser.sub)
+    if (sbUser) return sbUser
+    const stored = await kv.get(`account:${jwtUser.sub}`, "json") as any
+    if (stored) { sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }; licenseCache?.set("sb:" + jwtUser.sub, sbUser); return sbUser }
+    sbUser = { id: jwtUser.sub, tier: "free" }
+    ctx.waitUntil(kv.put(`account:${jwtUser.sub}`, JSON.stringify({ username: jwtUser.email, tier: "free" })))
+    licenseCache?.set("sb:" + jwtUser.sub, sbUser)
+    return sbUser
+  }
   // Fallback: validate against license server (handles cross-KV namespace)
   try {
     const res = await fetch(`https://arcana-license-server.lejzerv.workers.dev/api/license/validate`, {
