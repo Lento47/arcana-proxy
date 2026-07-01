@@ -6,11 +6,15 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "deploy:warm": "wrangler deploy -c wrangler.warm.jsonc",
     "types": "wrangler types"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^4.0.0",
     "typescript": "^5.8.0",
-    "@cloudflare/workers-types": "^4.0.0"
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
   }
 }

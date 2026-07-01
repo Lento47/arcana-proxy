@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "arcana-omniroute-warm",
+  "main": "src/warm.ts",
+  "compatibility_date": "2026-06-01",
+  "workers_dev": true,
+
+  "containers": [
+    {
+      "class_name": "OmniRouteContainer",
+      "image": "registry.cloudflare.com/<account_id>/arcana-omniroute:latest",
+      "max_instances": 1,
+      "instance_type": "standard-1"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "OMNIRoute", "class_name": "OmniRouteContainer" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["OmniRouteContainer"] }
+  ],
+
+  "queues": {
+    "consumers": [
+      { "queue": "arcana-omniroute-warm", "max_batch_size": 5, "max_batch_timeout": 30 }
+    ]
+  }
+}

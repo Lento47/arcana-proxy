@@ -1,0 +1,92 @@
+// ---------------------------------------------------------------------------
+// NOTE: Zone IDs and KV namespace IDs are hardcoded for manual deploys.
+// These should eventually be managed via CI/CD secrets / environment-specific
+// wrangler.jsonc generation instead of committed values.
+// ---------------------------------------------------------------------------
+
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "arcana-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "workers_dev": true,
+
+  "routes": [
+    { "pattern": "proxy.arcana.otnelhq.com/v1/*", "zone_id": "3c5d5afdbd04d5fda736a13e8008d659" }
+  ],
+
+  "kv_namespaces": [
+    { "binding": "ARCANA_PROXY", "id": "8c183296c8a14bd6857b1c896e7e5c3c" },
+    { "binding": "ARCANA_LICENSE", "id": "63e54bc7b2e8405cb4db5d926e1f2685" }
+  ],
+
+  "analytics_engine_datasets": [
+    { "binding": "ARCANA_PROXY_ANALYTICS", "dataset": "arcana_proxy_usage" }
+  ],
+
+  "send_email": [
+    { "name": "EMAIL" }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // OmniRoute Durable Object binding.
+  // The class (`OmniRouteContainer`) is defined and exported by the warm
+  // Worker (src/warm.ts → wrangler.warm.jsonc). The proxy Worker just gets
+  // a DO namespace handle via this binding; no migration needed here.
+  // Calling pattern: getContainer(env.OMNIRoute, "primary").fetch(req).
+  // Until that Worker is deployed, the binding is undefined and the priority
+  // list is forced to ["openrouter"] in code.
+  // ---------------------------------------------------------------------------
+  "durable_objects": {
+    "bindings": [
+      { "name": "OMNIRoute", "class_name": "OmniRouteContainer" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["OmniRouteContainer"] }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // Warm-up queue — producer in src/index.ts (throttled, ~30s) sends a ping
+  // before the first cold OmniRoute call. Consumer in src/warm.ts acks after
+  // hitting the container's /healthz.
+  // ---------------------------------------------------------------------------
+  "queues": {
+    "producers": [
+      { "binding": "OMNIRoute_WARM_QUEUE", "queue": "arcana-omniroute-warm" }
+    ]
+  },
+
+  // ---------------------------------------------------------------------------
+  // Staging — sandbox PayPal, workers.dev domain, no production routes
+  //   npx wrangler deploy --env staging
+  //   npx wrangler secret put --env staging PAYPAL_CLIENT_ID
+  //   npx wrangler secret put --env staging PAYPAL_CLIENT_SECRET
+  //
+  // WARNING: Staging shares the same KV namespace as production
+  // (`id = "8c183296c8a14bd6857b1c896e7e5c3c"`). All staging KV keys will
+  // collide with production keys. To avoid this:
+  //   - Create a separate staging KV namespace (recommended once you have
+  //     access to create new namespaces), OR
+  //   - Use a `staging:` key prefix in staging code paths.
+  // ---------------------------------------------------------------------------
+  "env": {
+    "staging": {
+      "workers_dev": true,
+      "routes": [],
+      "vars": {
+        "PAYPAL_SANDBOX": "true"
+      },
+      "kv_namespaces": [
+        { "binding": "ARCANA_PROXY", "id": "8c183296c8a14bd6857b1c896e7e5c3c" }
+      ],
+      "analytics_engine_datasets": [
+        { "binding": "ARCANA_PROXY_ANALYTICS", "dataset": "arcana_proxy_usage" }
+      ],
+      "send_email": [
+        { "name": "EMAIL" }
+      ]
+    }
+  }
+}

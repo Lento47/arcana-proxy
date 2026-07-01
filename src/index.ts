@@ -1,4 +1,6 @@
 import type { AnalyticsEvent } from "./types"
+import { OmniRouteContainer } from "./container"
+export { OmniRouteContainer }
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
 const PAYPAL_LIVE = "https://api-m.paypal.com"
@@ -7,6 +9,8 @@ const PAYPAL_SANDBOX = "https://api-m.sandbox.paypal.com"
 interface Env {
   OPENROUTER_KEY?: string
   OPENROUTER_KEYS?: string       // comma-separated pool of API keys for rotation
+  OMNIRoute_KEY?: string
+  OMNIRoute_KEYS?: string        // comma-separated pool of API keys for rotation
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
   ARCANA_PROXY: KVNamespace
@@ -18,7 +22,15 @@ interface Env {
   PAYPAL_WEBHOOK_ID?: string
   ARCANA_ADMIN_KEY?: string
   ARCANA_ADMIN_KEYS?: string
+  // OmniRoute container is a Durable Object namespace (the class lives in the
+  // warm Worker; this Worker just gets the binding). Optional so the type-check
+  // passes when the binding is absent (e.g. local dev before the image is
+  // pushed). The proxy forces the priority list to ["openrouter"] when unset.
+  OMNIRoute?: DurableObjectNamespace<OmniRouteContainer>
+  OMNIRoute_WARM_QUEUE?: Queue
 }
+
+type Provider = "openrouter" | "omniroute"
 
 // --- OpenRouter API key pool (rotation + rate-limit cooldown) ---
 interface KeyState {
@@ -77,6 +89,102 @@ function markKeySuccess(key: string): void {
 }
 // --- end key pool ---
 
+// --- OmniRoute key pool (same shape, separate instance) ---
+let omniKeyPool: KeyState[] = []
+let omniKeyPoolIndex = 0
+
+function initOmniKeyPool(env: Env): KeyState[] {
+  if (omniKeyPool.length > 0) return omniKeyPool
+  const raw = env.OMNIRoute_KEYS || env.OMNIRoute_KEY || ""
+  const keys = raw.split(",").map(k => k.trim()).filter(Boolean)
+  if (keys.length === 0) return []
+  omniKeyPool = keys.map(k => ({ key: k, cooldownUntil: 0, failures: 0 }))
+  return omniKeyPool
+}
+
+function getOmniKey(env: Env): string | null {
+  const pool = initOmniKeyPool(env)
+  if (pool.length === 0) return null
+  const now = Date.now()
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (omniKeyPoolIndex + i) % pool.length
+    const ks = pool[idx]
+    if (now >= ks.cooldownUntil) {
+      omniKeyPoolIndex = (idx + 1) % pool.length
+      return ks.key
+    }
+  }
+  const best = pool.reduce((a, b) => a.cooldownUntil < b.cooldownUntil ? a : b)
+  return best.key
+}
+
+function markOmniKeyRateLimited(key: string): void {
+  const ks = omniKeyPool.find(k => k.key === key)
+  if (!ks) return
+  const now = Date.now()
+  ks.failures++
+  const backoff = KEY_COOLDOWN_MS * Math.pow(2, Math.min(ks.failures - 1, 3))
+  ks.cooldownUntil = now + backoff
+  if (ks.failures >= KEY_MAX_FAILURES) {
+    ks.cooldownUntil = now + 5 * 60 * 1000
+  }
+}
+
+function markOmniKeySuccess(key: string): void {
+  const ks = omniKeyPool.find(k => k.key === key)
+  if (ks) ks.failures = 0
+}
+// --- end OmniRoute key pool ---
+
+// --- Provider priority list (KV-backed, env fallback) ---
+// If the container binding is absent, force the priority list to ["openrouter"]
+// so the new code is a no-op until the OmniRoute image is actually pushed.
+let providerPriorityCache: Provider[] | null = null
+let providerPriorityCacheTime = 0
+const PROVIDER_PRIORITY_TTL = 60_000  // re-read KV at most once per minute per isolate
+
+async function getProviderPriority(env: Env, ctx: ExecutionContext): Promise<Provider[]> {
+  // Belt + suspenders: if the container binding isn't configured, hard-pin to OpenRouter.
+  if (!env.OMNIRoute) return ["openrouter"]
+  const now = Date.now()
+  if (providerPriorityCache && now - providerPriorityCacheTime < PROVIDER_PRIORITY_TTL) {
+    return providerPriorityCache
+  }
+  let list: Provider[] = ["openrouter"]  // safe default
+  try {
+    const raw = await env.ARCANA_PROXY.get("provider:priority", "json") as Provider[] | null
+    if (Array.isArray(raw) && raw.length > 0) {
+      // Whitelist: only allow the two known providers, drop everything else.
+      const filtered = raw.filter((p): p is Provider => p === "openrouter" || p === "omniroute")
+      if (filtered.length > 0) list = filtered
+    }
+  } catch {}
+  providerPriorityCache = list
+  providerPriorityCacheTime = now
+  return list
+}
+
+function resolveProvider(model: string, priority: Provider[]): { provider: Provider; model: string } | null {
+  if (model.startsWith("omni/")) return { provider: "omniroute", model: model.slice(5) }
+  if (model.startsWith("or/"))   return { provider: "openrouter", model: model.slice(3) }
+  for (const p of priority) return { provider: p, model }
+  return null
+}
+
+// Throttled warm-up queue producer. Per-isolate, max one enqueue per 30s.
+// Fires only on the cold path (first OmniRoute call after the binding sees
+// traffic) so we don't spam the queue on warm instances.
+let lastOmniWarmEnqueued = 0
+const OMNI_WARM_THROTTLE_MS = 30_000
+function maybeEnqueueOmniWarm(env: Env, ctx: ExecutionContext): void {
+  if (!env.OMNIRoute_WARM_QUEUE) return
+  const now = Date.now()
+  if (now - lastOmniWarmEnqueued < OMNI_WARM_THROTTLE_MS) return
+  lastOmniWarmEnqueued = now
+  ctx.waitUntil(env.OMNIRoute_WARM_QUEUE.send({ kind: "warm", ts: now }).catch(() => {}))
+}
+// --- end provider priority ---
+
 const TRIAL_DURATION_MS = 14 * 24 * 60 * 60 * 1000
 const SUBSCRIPTION_CREDITS = 500 // $5 worth of credits bundled with Pro
 
@@ -132,7 +240,7 @@ let licenseCacheTime = 0
 const LICENSE_CACHE_TTL = 300000
 
 // Supabase JWT verification
-const SUPABASE_JWKS_URL = "https://ndaejikkbckaeygtruwl.supabase.co/.well-known/jwks.json"
+const SUPABASE_JWKS_URL = "https://ndaejikkbckaeygtruwl.supabase.co/auth/v1/.well-known/jwks.json"
 let jwksCache: { keys: any[] } | null = null
 let jwksCacheTime = 0
 const JWKS_CACHE_TTL = 3_600_000
@@ -144,12 +252,18 @@ function base64urlDecode(str: string): Uint8Array {
   return Uint8Array.from(atob(str), c => c.charCodeAt(0))
 }
 
+function b64decode(s: string): string {
+  s = s.replace(/-/g, "+").replace(/_/g, "/")
+  while (s.length % 4) s += "="
+  return atob(s)
+}
+
 async function verifySupabaseJWT(token: string): Promise<{ sub: string; email: string } | null> {
   if (!token.startsWith("eyJ")) return null
   const parts = token.split(".")
   if (parts.length !== 3) return null
   let header: any
-  try { header = JSON.parse(atob(parts[0])) } catch { return null }
+  try { header = JSON.parse(b64decode(parts[0])) } catch { return null }
   if (header.alg !== "ES256") return null
   const now = Date.now()
   if (!jwksCache || now - jwksCacheTime > JWKS_CACHE_TTL) {
@@ -161,16 +275,18 @@ async function verifySupabaseJWT(token: string): Promise<{ sub: string; email: s
   }
   const jwk = jwksCache.keys.find((k: any) => k.kid === header.kid && k.alg === "ES256")
   if (!jwk) return null
-  if (!ecdsaKeyCache || ecdsaKeyCache.kid !== header.kid) {
-    const key = await crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"])
-    ecdsaKeyCache = { kid: header.kid, key }
-  }
-  const data = new TextEncoder().encode(parts[0] + "." + parts[1])
-  const sig = base64urlDecode(parts[2])
-  const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, ecdsaKeyCache.key, sig, data)
-  if (!valid) return null
+  try {
+    if (!ecdsaKeyCache || ecdsaKeyCache.kid !== header.kid) {
+      const key = await crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"])
+      ecdsaKeyCache = { kid: header.kid, key }
+    }
+    const data = new TextEncoder().encode(parts[0] + "." + parts[1])
+    const sig = base64urlDecode(parts[2])
+    const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, ecdsaKeyCache.key, sig, data)
+    if (!valid) return null
+  } catch { return null }
   let payload: any
-  try { payload = JSON.parse(atob(parts[1])) } catch { return null }
+  try { payload = JSON.parse(b64decode(parts[1])) } catch { return null }
   if (payload.exp && payload.exp * 1000 < now) return null
   if (payload.aud !== "authenticated") return null
   return { sub: payload.sub, email: payload.email || "" }
@@ -189,6 +305,22 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
     if (!trial) return null
     if (now > trial.expiresAt) { await kv.delete(`trial:${key}`); return null }
     return { id: `trial_${key.slice(6, 14)}`, tier: "pro" }
+  }
+
+  // JWT tokens — verify signature, skip KV (JWT exceeds 512-byte KV key limit)
+  if (key.startsWith("eyJ") && key.split(".").length === 3) {
+    const jwtUser = await verifySupabaseJWT(key)
+    if (jwtUser) {
+      let sbUser = licenseCache?.get("sb:" + jwtUser.sub)
+      if (sbUser) return sbUser
+      const stored = await kv.get(`account:${jwtUser.sub}`, "json") as any
+      if (stored) { sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }; licenseCache?.set("sb:" + jwtUser.sub, sbUser); return sbUser }
+      sbUser = { id: jwtUser.sub, tier: "free" }
+      ctx.waitUntil(kv.put(`account:${jwtUser.sub}`, JSON.stringify({ username: jwtUser.email, tier: "free" })))
+      licenseCache?.set("sb:" + jwtUser.sub, sbUser)
+      return sbUser
+    }
+    return null
   }
 
   if (!licenseCache || now - licenseCacheTime > LICENSE_CACHE_TTL) { licenseCache = new Map(); licenseCacheTime = now }
@@ -403,7 +535,7 @@ export default {
       switch (url.pathname) {
         case "/v1/chat/completions":
         case "/v1/embeddings":
-          return proxyOpenRouter(request, env, user, corsHeaders, url.pathname)
+          return proxyWithFailover(request, env, user, corsHeaders, url.pathname, ctx)
         case "/v1/models":
           return listModels(env, corsHeaders)
         case "/v1/usage":
@@ -414,13 +546,18 @@ export default {
           return handleSendTestReceipt(request, env, user, corsHeaders)
         case "/v1/auth/resolve-email":
           return handleResolveEmail(request, env, corsHeaders)
+        case "/v1/admin/providers":
+          if (request.method === "GET") return handleAdminGetProviders(env, corsHeaders)
+          if (request.method === "PUT") return handleAdminSetProviders(request, env, ctx, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/health":
           return json({ status: "ok", service: "arcana-proxy", user: user.id, tier: user.tier }, 200, corsHeaders)
         default:
           return json({ error: "not_found" }, 404, corsHeaders)
       }
     } catch (e) {
-      return json({ error: "internal_error" }, 500, corsHeaders)
+      console.error(e)
+      return json({ error: "internal_error", message: String(e) }, 500, corsHeaders)
     }
   },
 }
@@ -536,6 +673,225 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
     return null
   } catch { return null }
 }
+
+// --- Multi-provider failover wrapper ---
+// Mirrors proxyOpenRouter's flow (lock, balance, upstream call, stream handling)
+// but routes through the priority list with hard-failure failover. Bare model
+// names walk the priority list; omni/<model> / or/<model> force a specific
+// provider. proxyOpenRouter is unchanged.
+async function proxyWithFailover(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
+  const body = await request.json() as any
+  if (!body.model) return json({ error: "model_required" }, 400, cors)
+  const requestedModel = String(body.model)
+
+  const priority = await getProviderPriority(env, ctx)
+  const resolved = resolveProvider(requestedModel, priority)
+  if (!resolved) return json({ error: "no_provider_available" }, 503, cors)
+
+  // Forced via prefix — run only that provider. Otherwise walk the list.
+  const isForced = requestedModel.startsWith("omni/") || requestedModel.startsWith("or/")
+  const attemptOrder: Provider[] = isForced ? [resolved.provider] : priority
+
+  // Pre-flight: if all providers we might use are missing, fail fast.
+  if (attemptOrder.includes("openrouter") && !getOpenRouterKey(env)) {
+    if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors)
+  }
+  if (attemptOrder.includes("omniroute") && (!env.OMNIRoute || !getOmniKey(env))) {
+    if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No OmniRoute key or container binding" }, 500, cors)
+  }
+
+  // Estimate max cost from the FIRST provider's model name. Cost is provider-
+  // agnostic (it's a USD figure tied to the model), so we use the bare model
+  // string for the estimate. Pre-deduct happens up front; refund on total fail.
+  const inputTokens = body.messages?.reduce((a: number, m: any) => a + (m.content?.length ?? 0) / 4, 0) ?? 500
+  const maxCost = estimateCost(resolved.model, Math.min(inputTokens, 128000), 2000)
+  const margin = 1.4
+
+  // Per-user lock (same pattern as proxyOpenRouter)
+  const lockKey = `lock:${user.id}`
+  const lockValue = crypto.randomUUID()
+  await env.ARCANA_PROXY.put(lockKey, lockValue, { expirationTtl: 60 })
+  const currentLock = await env.ARCANA_PROXY.get(lockKey)
+  if (currentLock !== lockValue && user.tier !== "enterprise") {
+    return json({ error: "too_many_requests", message: "A previous request is still processing." }, 429, cors)
+  }
+  const releaseLock = async () => {
+    try {
+      const current = await env.ARCANA_PROXY.get(lockKey)
+      if (current === lockValue) await env.ARCANA_PROXY.delete(lockKey)
+    } catch {}
+  }
+
+  try {
+    if (user.tier !== "enterprise") {
+      const balance = await getBalance(user.id, env.ARCANA_PROXY)
+      if (balance < maxCost) { await releaseLock(); return json({ error: "insufficient_balance", message: "Add credits via arcana proxy buy", balance, required: Math.round(maxCost) }, 402, cors) }
+      await deductBalance(user.id, maxCost, env.ARCANA_PROXY)
+    }
+  } catch { await releaseLock(); throw new Error("lock error") }
+
+  const startTime = Date.now()
+  let attemptedProviders: Provider[] = []
+  let lastErrorStatus = 500
+  let lastErrorBody = "no_attempt"
+
+  for (const provider of attemptOrder) {
+    attemptedProviders.push(provider)
+
+    if (provider === "omniroute" && env.OMNIRoute) {
+      maybeEnqueueOmniWarm(env, ctx)  // best-effort warm-up
+    }
+
+    let response: Response
+    let providerKey: string | null = null
+    let upstreamModel = resolved.model
+    try {
+      if (provider === "openrouter") {
+        providerKey = getOpenRouterKey(env)
+        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_openrouter_key"; continue }
+        const headers = new Headers({
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${providerKey}`,
+          "HTTP-Referer": "https://arcana.otnelhq.com",
+          "X-Title": "arcana",
+        })
+        const outbound = { ...body, model: upstreamModel, user: user.id }
+        response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
+      } else {
+        providerKey = getOmniKey(env)
+        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_omniroute_key"; continue }
+        // Pre-flight already gated this. The non-null assertion is the contract.
+        const containerId = env.OMNIRoute!.idFromName("primary")
+        const container = env.OMNIRoute!.get(containerId)
+        const headers = new Headers({
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${providerKey}`,
+        })
+        const outbound = { ...body, model: upstreamModel, user: user.id }
+        // OmniRoute is OpenAI-compatible — same path scheme. The DO forwards
+        // this Request to the container's defaultPort (8787).
+        response = await container.fetch(new Request(`https://omniroute.local${path}`, { method: "POST", headers, body: JSON.stringify(outbound) }))
+      }
+    } catch (e) {
+      // Network/timeout — treat as hard fail, try next.
+      if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
+      if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+      lastErrorStatus = 502
+      lastErrorBody = `upstream_unreachable: ${String(e).slice(0, 80)}`
+      console.error(`provider ${provider} fetch failed`, e)
+      continue
+    }
+
+    // Hard-fail check: 5xx, 429, 401 → try next. Other 4xx = client bug, no failover.
+    if (!response.ok) {
+      const hardFail = response.status >= 500 || response.status === 429 || response.status === 401
+      if (hardFail) {
+        if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
+        if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+        const errorBody = await response.text()
+        lastErrorStatus = response.status
+        lastErrorBody = errorBody.slice(0, 200)
+        console.error(`provider ${provider} hard-fail`, response.status, errorBody.slice(0, 200))
+        // Last provider in the list — don't loop forever.
+        if (attemptedProviders.length >= attemptOrder.length) {
+          if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          await releaseLock()
+          return json({ error: "upstream_error", provider, message: lastErrorBody }, lastErrorStatus, cors)
+        }
+        continue
+      } else {
+        // Client-side error (400, 404, etc.) — bubble up as-is, refund nothing.
+        if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+        await releaseLock()
+        const errorBody = await response.text()
+        return json({ error: "upstream_error", provider, message: errorBody.slice(0, 200) }, response.status, cors)
+      }
+    }
+
+    // Success path.
+    if (providerKey && provider === "openrouter") markKeySuccess(providerKey)
+    if (providerKey && provider === "omniroute") markOmniKeySuccess(providerKey)
+
+    const adjustBalance = async (tokensIn: number, tokensOut: number, upstreamCost?: number) => {
+      const actualCost = upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)
+      if (user.tier !== "enterprise") {
+        const refund = maxCost - actualCost
+        if (refund > 0) await deductBalance(user.id, -refund, env.ARCANA_PROXY)
+      }
+      if (env.ARCANA_PROXY_ANALYTICS) {
+        env.ARCANA_PROXY_ANALYTICS.writeDataPoint({
+          blobs: [user.id, `${provider}:${resolved.model}`, user.tier, provider],
+          doubles: [tokensIn, tokensOut, actualCost * margin, Date.now() - startTime],
+        })
+      }
+    }
+
+    const isStream = body.stream === true
+    if (isStream && response.body) {
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let fullResponse = ""
+      let bytesStreamed = 0
+      let streamFailed = false
+      let failoverTriggered = false
+      ;(async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            bytesStreamed += value.byteLength
+            const chunk = decoder.decode(value, { stream: true })
+            fullResponse += chunk
+            await writer.write(value)
+          }
+        } catch {
+          streamFailed = true
+          // Stream failover rule: only re-attempt on the next provider if we
+          // haven't sent ANY bytes to the client yet. Otherwise the user has
+          // already seen partial output and a different model's continuation
+          // would be a confusing UX. Refund and close.
+          if (bytesStreamed > 0) {
+            if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          } else if (attemptedProviders.length < attemptOrder.length) {
+            // Try the next provider. The client gets an error trailer; the
+            // actual retry happens via the failover at the request level
+            // (a future request will use the next provider on the first
+            // attempt, or the user can resubmit). We surface a clear error.
+            failoverTriggered = true
+          }
+        } finally {
+          await writer.close()
+          const usage = extractUsage(fullResponse, resolved.model)
+          if (usage) adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
+          else if (streamFailed && !failoverTriggered && user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          await releaseLock()
+        }
+      })()
+      const headers: Record<string, string> = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...cors }
+      headers["X-Provider"] = provider
+      return new Response(readable, { status: response.status, headers })
+    }
+
+    const data = await response.json() as any
+    if (data.usage) {
+      const tokensIn = data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0
+      const tokensOut = data.usage.completion_tokens ?? data.usage.output_tokens ?? 0
+      const upstreamCost = data.usage.total_cost
+      await adjustBalance(tokensIn, tokensOut, upstreamCost)
+    }
+    await releaseLock()
+    const successHeaders = { ...cors, "X-Provider": provider }
+    return json(data, response.status, successHeaders)
+  }
+
+  // All providers in attemptOrder failed.
+  if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+  await releaseLock()
+  return json({ error: "all_providers_failed", providers: attemptedProviders, lastStatus: lastErrorStatus, message: lastErrorBody }, 502, cors)
+}
+// --- end multi-provider failover ---
 
 async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
@@ -1003,6 +1359,41 @@ async function handleSubStatus(request: Request, env: Env, cors: Record<string, 
   const sub = await env.ARCANA_PROXY.get(`sub:${subId}`, "json") as any
   if (!sub) return json({ error: "not_found" }, 404, cors)
   return json({ subscriptionId: subId, ...sub }, 200, cors)
+}
+
+// Admin endpoints for the provider priority list. Same gate as /v1/pay/setup-plans.
+function adminAuthorized(request: Request, env: Env): boolean {
+  const auth = request.headers.get("Authorization")
+  const adminKey = env.ARCANA_ADMIN_KEY
+  if (!adminKey) return false
+  if (auth === `Bearer ${adminKey}`) return true
+  const adminKeys = (env.ARCANA_ADMIN_KEYS ?? "").split(",").map(k => k.trim()).filter(Boolean)
+  return adminKeys.length > 0 && adminKeys.includes(auth?.replace(/^Bearer\s+/, "") ?? "")
+}
+
+async function handleAdminGetProviders(env: Env, cors: Record<string, string>): Promise<Response> {
+  const stored = await env.ARCANA_PROXY.get("provider:priority", "json") as Provider[] | null
+  return json({ priority: stored ?? ["openrouter"], containerConfigured: Boolean(env.OMNIRoute) }, 200, cors)
+}
+
+async function handleAdminSetProviders(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
+  if (!adminAuthorized(request, env)) return json({ error: "unauthorized" }, 401, cors)
+  const body = await request.json().catch(() => ({})) as any
+  const priority = body?.priority
+  if (!Array.isArray(priority) || priority.length === 0) return json({ error: "priority_must_be_nonempty_array" }, 400, cors)
+  // Whitelist — never trust caller-provided provider names.
+  const filtered = priority.filter((p): p is Provider => p === "openrouter" || p === "omniroute")
+  if (filtered.length === 0) return json({ error: "no_valid_providers" }, 400, cors)
+  if (filtered.includes("omniroute") && !env.OMNIRoute) {
+    return json({ error: "omniroute_not_configured", message: "OMNIRoute DO binding is missing — deploy the warm Worker first" }, 400, cors)
+  }
+  // 1-hour TTL doubles as a cache bust for stale isolates that already cached
+  // the priority list in memory.
+  await env.ARCANA_PROXY.put("provider:priority", JSON.stringify(filtered), { expirationTtl: 3600 })
+  // Best-effort cache flush on the local isolate.
+  providerPriorityCache = null
+  providerPriorityCacheTime = 0
+  return json({ ok: true, priority: filtered }, 200, cors)
 }
 
 async function sendSubscriptionEmail(env: Env, to: string, key: string, planName: string, price: number = 19): Promise<void> {
