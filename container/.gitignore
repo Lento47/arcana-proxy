@@ -1,0 +1,16 @@
+# container/ holds the build context for Cloudflare Containers. The Dockerfile
+# is committed; the build artifacts (.dockerignore target patterns) and any
+# vendored source are not.
+.git
+.dockerignore
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+data
+.build
+.next
+out
+dist
+*.log

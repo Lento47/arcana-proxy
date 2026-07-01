@@ -6,9 +6,10 @@
 import { Container } from "@cloudflare/containers"
 
 export class OmniRouteContainer extends Container {
-  // OmniRoute's default listen port. Override via the container's runtime env
-  // if the image listens on a different port.
-  defaultPort = 8787
+  // OmniRoute's default listen port (per upstream Dockerfile: PORT=20128).
+  // Override at runtime by setting the PORT env var on the container if the
+  // image is configured to listen on a different port.
+  defaultPort = 20128
   // Keep the container warm for 10 minutes after the last request so
   // subsequent traffic stays fast.
   sleepAfter = "10m"

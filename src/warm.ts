@@ -18,8 +18,10 @@ export default {
       try {
         // getContainer gives us a stub that .fetch()es into the container.
         // Any response (or thrown error) counts as "warmed".
+        // Upstream OmniRoute exposes /api/monitoring/health on the dashboard
+        // port (see scripts/dev/healthcheck.mjs in the OmniRoute repo).
         const inst = getContainer(env.OMNIRoute, "primary")
-        await inst.fetch(new Request("http://container/healthz", { method: "GET" })).catch(() => null)
+        await inst.fetch(new Request("http://container/api/monitoring/health", { method: "GET" })).catch(() => null)
       } catch {
         // Swallow — the next producer tick will retry.
       } finally {

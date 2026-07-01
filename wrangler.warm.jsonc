@@ -8,7 +8,8 @@
   "containers": [
     {
       "class_name": "OmniRouteContainer",
-      "image": "registry.cloudflare.com/<account_id>/arcana-omniroute:latest",
+      "image": "./container/Dockerfile",
+      "image_build_context": "./container",
       "max_instances": 1,
       "instance_type": "standard-1"
     }
