@@ -22,19 +22,39 @@ binding.
 
 Endpoints:
 
-| Path | Purpose |
-| --- | --- |
-| `POST /v1/chat/completions` | OpenAI-compatible chat completions (and embeddings) |
-| `GET /v1/models` | Merged model catalog across all configured providers |
-| `GET /v1/free-usage/sessions/current` | Authoritative free-tier status for the calling user |
-| `GET /v1/admin/providers` | Admin: read the active provider priority list (auth-gated) |
-| `PUT /v1/admin/providers` | Admin: set the provider priority list (auth-gated) |
-| `POST /v1/pay/create-order` | PayPal order create (credit purchase) |
-| `GET /v1/balance` | Caller's credit balance |
-| `GET /v1/sessions`, `GET /v1/sessions/<id>` | Caller's session history |
-| `GET /v1/purchases` | Caller's purchase history |
-| `GET /v1/profile`, `PUT /v1/profile` | Caller's profile |
-| `GET /v1/health` | Liveness probe |
+| Path | Method | Purpose |
+| --- | --- | --- |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat completions |
+| `/v1/embeddings` | POST | OpenAI-compatible embeddings (same dispatch path as chat) |
+| `/v1/models` | GET | Merged model catalog across all configured providers |
+| `/v1/usage` | GET | Caller's daily usage counters |
+| `/v1/balance` | GET | Caller's credit balance |
+| `/v1/sessions` | GET | Caller's session history (paginated) |
+| `/v1/sessions/<id>` | GET | Single session detail (UUID in path) |
+| `/v1/purchases` | GET | Caller's purchase history |
+| `/v1/profile` | GET, PUT | Caller's profile |
+| `/v1/free-usage/sessions/current` | GET | Authoritative free-tier status for the calling user |
+| `/v1/send-receipt` | POST | Send a test receipt email (admin only, uses `EMAIL` binding) |
+| `/v1/auth/resolve-email` | GET | Reverse-lookup a license key/sub id by email |
+| `/v1/identity/validate-email` | GET | Validate an email is a known subscriber |
+| `/v1/trial/start` | POST | Start a 14-day Pro trial (one per IP, gated by `TRIAL_ENABLED=true`) |
+| `/v1/pay/create-order` | POST | PayPal order create (credit purchase) |
+| `/v1/pay/capture-order` | POST | CLI flow: capture a PayPal order |
+| `/v1/pay/capture-return` | GET, POST | Web flow: capture a PayPal order after redirect |
+| `/v1/pay/webhook` | POST | PayPal webhook (verified with `PAYPAL_WEBHOOK_ID`) |
+| `/v1/pay/setup-plans` | POST | Admin: create the PayPal product + plans |
+| `/v1/pay/create-sub` | POST | Admin: create a PayPal subscription |
+| `/v1/pay/sub-status` | GET | Admin: check a subscription's status |
+| `/v1/admin/providers` | GET | Admin: read the active provider priority list |
+| `/v1/admin/providers` | PUT | Admin: set the provider priority list |
+| `/v1/health` | GET | Liveness probe |
+
+CORS preflight (OPTIONS) is allowed on all paths. The `Access-Control-Allow-Headers` whitelist
+includes: `Content-Type, Authorization, X-Arcana-Request, X-Arcana-Turn, X-Arcana-Turn-Id,
+X-Arcana-Session, X-Arcana-Session-Id`. The `X-Arcana-Turn-Id` / `X-Arcana-Turn` / `X-Arcana-Request`
+headers carry the per-turn idempotency key consumed by the free-tier reservation; the
+`X-Arcana-Session` / `X-Arcana-Session-Id` headers carry the conversation key for free-session
+binding.
 
 ## Provider routing model — read this first
 
@@ -80,6 +100,11 @@ about. The current model is explicit on both axes.
 | `aihubmix` | `AIHUBMIX_KEY` or `AIHUBMIX_KEYS` (rotating pool) | `https://aihubmix.com` | `https://api.inferera.com` (on hard 5xx from primary) | Bearer auth. |
 | `cloudflare` | `CLOUDFLARE_KEY` or `CLOUDFLARE_KEYS` (rotating pool) | `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1` | — | Bearer auth. Rotating tokens do not help with upstream rate limits (CF rate-limits per-account, not per-token). |
 | `omniroute` | `OMNIRoute_KEY` or `OMNIRoute_KEYS` (rotating pool) | Service binding to `arcana-omniroute-warm` Worker | — | The container is owned by the warm Worker; the proxy reaches it via a service-binding RPC named `omFetch`. The container is not addressable from the proxy directly. |
+
+**Other response headers worth knowing:**
+
+- `X-Provider`: set on successful chat-completion responses; value is the provider that actually served the request (e.g. `openrouter`, `aihubmix`, `cloudflare`, `omniroute`). Useful for debugging which provider answered when a request fell through the failover chain.
+- `X-RateLimit-Remaining`: set on responses from the per-day limit check (the `checkDailyLimit` path). Value is the integer turns/days remaining for the calling user on the current calendar day. Not set on free-tier responses (those use the `X-Arcana-Free-*` family).
 
 Key pool behavior (mirrored across all four providers):
 
@@ -193,7 +218,7 @@ Free users (`tier === "free"`) are subject to the following limits. The spec liv
 
 | Limit | Value | Where it lives | Rejection code |
 | --- | --- | --- | --- |
-| Sessions per reset period | 1 | `FREE_SESSION_RESET_MS` (7 days, anchored to `activated_at`) | `free_weekly_cooldown` |
+| Sessions per reset period | 1 | `FREE_SESSION_RESET_MS` (7 days, anchored to `activated_at`) | _not enforced_ (see note above) |
 | Session duration | 60 minutes | `FREE_SESSION_DURATION_MS` | `free_session_expired` |
 | Turn allowance | 10 turns | `FREE_SESSION_TURN_LIMIT` | `free_turn_limit_reached` |
 | Per-turn input cap | 16,384 raw input tokens | `FREE_MAX_INPUT_TOKENS` | `free_turn_budget_reached` |
@@ -244,13 +269,21 @@ headers, plus `used` and `remaining` integer fields).
 | --- | --- |
 | `free_turn_limit_reached` | All ten turns were admitted. |
 | `free_session_expired` | The one-hour active window ended. |
-| `free_weekly_cooldown` | The user is waiting for `reset_at`. |
 | `free_session_conversation_mismatch` | Another conversation tried to use the active allowance. |
 | `free_turn_budget_reached` | One turn exceeded its per-turn provider-call, input, or output ceiling. |
 | `free_weekly_token_limit_reached` | The user's weekly combined in+out token allowance is used up. |
 
+> **Note on `free_weekly_cooldown`:** the spec documents this code for the case where a free user
+> in their 7-day cooldown window is admitted by the proxy (the proxy sees no record and acts as
+> if they are eligible). The proxy **does not** emit this code today — it has no way to detect
+> the cooldown state without a Durable Object. This is a known gap that the DO migration will
+> close. Until then, a free user who somehow gets through (e.g. by hitting a different turn-id
+> for a previously-exhausted conversation) will be admitted but immediately re-`exhausted` on
+> the very next turn. UX impact: minor. Security impact: none.
+
 The free-tier spec calls for these errors to be treated as **terminal** on the client side — no
-automatic retry. The `Retry-After` header is set where applicable.
+automatic retry. The `Retry-After` header is **not currently set** by the proxy for any of these
+codes; the spec lists it as a future addition alongside the DO migration.
 
 ### Bypass behavior
 
@@ -267,10 +300,15 @@ These are real, current, and worth knowing before you ship.
 
 1. **Free-usage authoritative store is KV, not a Durable Object.** The free-usage spec explicitly
    calls for a SQLite-backed Durable Object per subject key to guarantee atomic reservation under
-   concurrent requests. The current implementation uses the `ARCANA_PROXY` KV namespace under the
-   key `free_usage:<sha256("free:" + userId).slice(0,40)>`. KV is eventually consistent and
-   read-modify-write is not atomic. The spec QA test "11 concurrent unique turn requests admit
-   exactly 10" cannot pass under KV. The DO migration is tracked separately.
+   concurrent requests. The current implementation uses the `ARCANA_PROXY` KV namespace under
+   the key `free_usage:<sha256("free:" + userId).slice(0,40)>`. KV is eventually consistent and
+   read-modify-write is not atomic — two concurrent `reserveFreeTurn` calls for the same subject
+   can both read `turnsUsed=9` and both write `turnsUsed=10`, admitting 11 turns instead of 10.
+   The DO migration is tracked separately. Two related gaps fall out of this:
+   - `free_weekly_cooldown` is documented in the spec but **not emitted** by the proxy — without
+     a DO, the proxy has no way to detect the cooldown state (it sees "no record" and admits).
+   - Token accumulation is best-effort: the `settleFreeTurn` write goes through `ctx.waitUntil`
+     and is not atomic with the response.
 
 2. **The per-turn input cap is enforced against a `content.length / 4` estimate**, not a real
    tokenizer. A free user with 30K characters of markdown English will be rejected (estimated
@@ -341,7 +379,9 @@ status (which secrets/vars are present).
 
 | File | Purpose |
 | --- | --- |
-| `src/index.ts` | The whole proxy Worker (router, auth, providers, free-tier, admin). Single file by design. |
+| `src/index.ts` | The whole proxy Worker (router, auth, providers, free-tier, admin). Single file by design. ~110 KB / ~3,400 lines. |
+| `src/index.ts` — `proxyOpenRouter` | Direct-path chat completion: handles the `or/`, `cf/`, `cloudflare/` prefixes (cloudflare since `cee753e`); bypasses the priority list. |
+| `src/index.ts` — `proxyWithFailover` | Multi-provider dispatch: walks the priority list, handles `omni/`, `aihub/`, `aihubmix/` prefixes, applies free-tier limits to the failover path. |
 | `src/container.ts` | `OmniRouteContainer` class (owned by the warm Worker; re-exported here so the binding has a class to reference). |
 | `src/warm.ts` | The `arcana-omniroute-warm` Worker: container startup, warm-up queue consumer, service-binding RPC. |
 | `src/types.ts` | Shared types (`UserInfo`, `AnalyticsEvent`). |
@@ -354,4 +394,4 @@ status (which secrets/vars are present).
 - `L:\PROJECTS\arcana\docs\free-usage-weekly-session-plan.md` — free-usage spec (authoritative for policy).
 - `L:\PROJECTS\arcana\docs\architecture\arcana-breaking-change-map.md` — Arcana-native runtime contract.
 - `L:\PROJECTS\arcana\.vault\phase2-providers.md` — historical context on the provider router.
-- `L:\PROJECTS\arcana-proxy\.github\workflows\deploy.yml` — CI deploy workflow (if any).
+- `L:\PROJECTS\arcana-proxy\.github\workflows\deploy.yml` — CI deploy: triggers on push to `master`, runs `npx wrangler deploy` with `secrets.CLOUDFLARE_API_TOKEN`. Manual `workflow_dispatch` is also wired.
