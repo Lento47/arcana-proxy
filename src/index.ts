@@ -963,6 +963,9 @@ export default {
           if (request.method === "GET") return handleAdminGetProviders(env, corsHeaders)
           if (request.method === "PUT") return handleAdminSetProviders(request, env, ctx, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/admin/licenses":
+          if (request.method === "POST") return handleAdminMintLicense(request, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/sessions":
           if (request.method === "GET") return handleGetSessions(request, user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
@@ -1984,6 +1987,41 @@ async function handleAdminSetProviders(request: Request, env: Env, ctx: Executio
   providerPriorityCache = null
   providerPriorityCacheTime = 0
   return json({ ok: true, priority: filtered }, 200, cors)
+}
+
+// Admin: mint a fresh license key bound to a Supabase user. Used by the site
+// device-flow completion handler at /auth/device/complete. The returned key
+// is the same shape as PayPal-issued keys (ARCANA-PRO-...) and validates via
+// the standard license:<key> lookup in getUser().
+async function handleAdminMintLicense(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!adminAuthorized(request, env)) return json({ error: "unauthorized" }, 401, cors)
+  const body = await request.json().catch(() => ({})) as any
+  const supabaseUserId = String(body?.supabaseUserId ?? "").trim()
+  const email = String(body?.email ?? "").trim().toLowerCase()
+  const planRaw = String(body?.plan ?? "pro").trim().toLowerCase()
+  const allowedPlans = new Set(["pro", "team", "enterprise"])
+  const plan = allowedPlans.has(planRaw) ? planRaw : "pro"
+  if (!supabaseUserId || !email) return json({ error: "missing_fields", required: ["supabaseUserId", "email"] }, 400, cors)
+
+  const key = await generateLicenseKey()
+  const createdAt = Date.now()
+  // No expiresAt — device-flow keys are open-ended. The reverse index is
+  // mirrored from the PayPal path so /v1/identity/validate-email and other
+  // email-lookup routes continue to work uniformly.
+  await env.ARCANA_PROXY.put(`license:${key}`, JSON.stringify({
+    id: email,
+    tier: plan,
+    supabaseUserId,
+    source: "device_flow",
+    createdAt,
+  }))
+  await env.ARCANA_PROXY.put(`email_account:${email}`, JSON.stringify({
+    licenseKey: key,
+    tier: plan,
+    source: "device_flow",
+    createdAt,
+  }), { expirationTtl: 365 * 86400 })
+  return json({ licenseKey: key, tier: plan, createdAt }, 200, cors)
 }
 
 async function sendSubscriptionEmail(env: Env, to: string, key: string, planName: string, price: number = 19): Promise<void> {
