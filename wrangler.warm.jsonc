@@ -26,6 +26,9 @@
   ],
 
   "queues": {
+    "producers": [
+      { "binding": "OMNIRoute_WARM_QUEUE", "queue": "arcana-omniroute-warm" }
+    ],
     "consumers": [
       { "queue": "arcana-omniroute-warm", "max_batch_size": 5, "max_batch_timeout": 30 }
     ]

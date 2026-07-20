@@ -5,6 +5,8 @@ import type { AnalyticsEvent } from "./types"
 // the proxy Worker only references the type for env typing.
 export { OmniRouteContainer } from "./container"
 import type { OmniRouteContainer } from "./container"
+export { FreeUsageDO } from "./free-usage-do"
+import type { FreeUsageDO } from "./free-usage-do"
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
 const AIHUBMIX_URL = "https://aihubmix.com"
@@ -1732,6 +1734,50 @@ async function handlePayPalWebhook(request: Request, env: Env, cors: Record<stri
   }
 }
 
+// --- Email theme ---
+const THEME = {
+  bg: "#0B0D12",
+  card: "#11151C",
+  border: "#1D2430",
+  borderLight: "#2A3345",
+  text: "#E7ECF3",
+  textMuted: "#8A94A6",
+  textDim: "#5B6380",
+  textDimmer: "#3D4560",
+  accent: "#8B5CF6",
+  success: "#10B981",
+  code: "#D9F99D",
+  fontStack: "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+}
+
+function wrapInLayout(title: string, innerHtml: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>${escapeHtml(title)}</title>
+<style>
+@media (prefers-color-scheme: light) {
+  body, table, td, div, p { background-color: ${THEME.bg} !important; color: ${THEME.text} !important; }
+}
+</style>
+</head>
+<body style="margin:0;padding:0;background:${THEME.bg};font-family:${THEME.fontStack}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
+<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;background:${THEME.card};border:1px solid ${THEME.border};border-radius:8px">
+${innerHtml}
+</table>
+</td></tr></table>
+</body>
+</html>`
+}
+
 function generateLicenseKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32))
   const b64 = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
@@ -1943,33 +1989,31 @@ async function handleAdminSetProviders(request: Request, env: Env, ctx: Executio
 async function sendSubscriptionEmail(env: Env, to: string, key: string, planName: string, price: number = 19): Promise<void> {
   if (!env.EMAIL) return
   try {
-    const html = `<!DOCTYPE html>
-<html><body style="margin:0;padding:0;background:#0B0D12;font-family:-apple-system,sans-serif">
-<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:40px 16px">
-<table width="520" cellpadding="0" cellspacing="0" style="background:#11151C;border:1px solid #1D2430;border-radius:8px">
-<tr><td style="padding:24px 32px 0"><span style="color:#8B5CF6;font-size:16px">⛧</span> <span style="color:#8A94A6">ARCANA</span> <span style="color:#5B6380;font-size:11px">decrypt the arcane</span></td></tr>
-<tr><td style="padding:16px 32px 0"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+    const safeKey = escapeHtml(key)
+    const safePlan = escapeHtml(planName)
+    const inner = `
+<tr><td style="padding:24px 32px 0"><span role="img" aria-label="Arcana" style="color:${THEME.accent};font-size:16px">⛧</span> <span style="color:${THEME.textMuted}">ARCANA</span> <span style="color:${THEME.textDim};font-size:11px">decrypt the arcane</span></td></tr>
+<tr><td style="padding:16px 32px 0"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 <tr><td style="padding:28px 32px 4px;text-align:center">
-<div style="color:#10B981;font-size:11px;font-weight:600;letter-spacing:.5px;margin-bottom:8px">● Confirmed</div>
-<div style="font-size:28px;font-weight:700;color:#E7ECF3">${planName}</div>
-<div style="font-size:13px;color:#8A94A6;margin-top:6px">$${price}.00 USD · includes 500 proxy credits</div>
+<div style="color:${THEME.success};font-size:11px;font-weight:600;letter-spacing:.5px;margin-bottom:8px">● Confirmed</div>
+<div style="font-size:28px;font-weight:700;color:${THEME.text}">${safePlan}</div>
+<div style="font-size:13px;color:${THEME.textMuted};margin-top:6px">$${price}.00 USD · includes 500 proxy credits</div>
 </td></tr>
-<tr><td style="padding:20px 32px 0"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+<tr><td style="padding:20px 32px 0"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 <tr><td style="padding:20px 32px 8px">
-<div style="color:#8A94A6;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Your License Key</div>
-<div style="background:#0B0D12;border:1px solid #1D2430;padding:14px;text-align:center;font-family:ui-monospace,monospace;font-size:14px;color:#D9F99D;word-break:break-all;user-select:all">${key}</div>
-<p style="color:#5B6380;font-size:12px;margin-top:12px;line-height:1.5">Enter this key in the CLI:<br><code style="background:#0B0D12;padding:4px 8px;color:#D9F99D;font-family:monospace;font-size:12px">arcana license activate ${key.slice(0, 16)}...</code></p>
+<div style="color:${THEME.textMuted};font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Your License Key</div>
+<div style="background:${THEME.bg};border:1px solid ${THEME.border};padding:14px;text-align:center;font-family:ui-monospace,monospace;font-size:14px;color:${THEME.code};word-break:break-all;user-select:all">${safeKey}</div>
+<p style="color:${THEME.textDim};font-size:12px;margin-top:12px;line-height:1.5">Enter this key in the CLI:<br><code style="background:${THEME.bg};padding:4px 8px;color:${THEME.code};font-family:monospace;font-size:12px">arcana license activate ${escapeHtml(key.slice(0, 16))}...</code></p>
 </td></tr>
-<tr><td style="padding:0 32px"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+<tr><td style="padding:0 32px"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 <tr><td style="padding:20px 32px 24px;text-align:center">
-<div style="color:#5B6380;font-size:11px">ARCANA Runtime Infrastructure · Otnel</div>
-</td></tr>
-</table></td></tr></table></body></html>`
+<div style="color:${THEME.textDim};font-size:11px">ARCANA Runtime Infrastructure · Otnel</div>
+</td></tr>`
     await env.EMAIL.send({
       to,
       from: { email: "receipts@otnelhq.com", name: "Arcana" },
       subject: "Your Arcana Pro license key is ready",
-      html,
+      html: wrapInLayout("Arcana Pro — License Key", inner),
       text: `Arcana Pro — License Key\n\nYour Pro subscription is active.\nLicense key: ${key}\n\nEnter in CLI: arcana license activate ${key}\n\nARCANA Runtime Infrastructure`,
     })
   } catch {}
@@ -1977,60 +2021,54 @@ async function sendSubscriptionEmail(env: Env, to: string, key: string, planName
 
 function receiptHtml(amount: string, credits: string, details: [string, string][], status: string, ctaUrl?: string): string {
   const detailRows = details.map(([label, val]) =>
-    `<tr><td style="padding:8px 0;color:#8A94A6;font-size:13px">${label}</td><td style="padding:8px 0;color:#E7ECF3;font-size:13px;text-align:right;font-family:ui-monospace,SFMono-Regular,monospace">${val}</td></tr>`
+    `<tr><td style="padding:8px 0;color:${THEME.textMuted};font-size:13px">${escapeHtml(label)}</td><td style="padding:8px 0;color:${THEME.text};font-size:13px;text-align:right;font-family:ui-monospace,SFMono-Regular,monospace">${escapeHtml(val)}</td></tr>`
   ).join("")
-  return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head>
-<body style="margin:0;padding:0;background:#0B0D12;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
-<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;background:#11151C;border:1px solid #1D2430;border-radius:8px">
-
+  const safeStatus = escapeHtml(status)
+  const inner = `
 <!-- header -->
 <tr><td style="padding:24px 32px 0">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-<tr><td style="font-size:13px;color:#8A94A6;vertical-align:middle">
-<span style="color:#8B5CF6;font-size:16px;margin-right:6px">⛧</span>ARCANA<span style="color:#5B6380;margin-left:8px;font-size:11px">decrypt the arcane</span>
+<tr><td style="font-size:13px;color:${THEME.textMuted};vertical-align:middle">
+<span role="img" aria-label="Arcana" style="color:${THEME.accent};font-size:16px;margin-right:6px">⛧</span>ARCANA<span style="color:${THEME.textDim};margin-left:8px;font-size:11px">decrypt the arcane</span>
 </td></tr></table>
 </td></tr>
 
 <!-- divider -->
-<tr><td style="padding:16px 32px 0"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+<tr><td style="padding:16px 32px 0"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 
 <!-- hero -->
 <tr><td style="padding:28px 32px 4px;text-align:center">
-<div style="color:#10B981;font-size:11px;font-weight:600;letter-spacing:0.5px;margin-bottom:8px">● ${status}</div>
-<div style="font-size:36px;font-weight:700;color:#E7ECF3;letter-spacing:-0.5px">+${credits}</div>
-<div style="font-size:13px;color:#8A94A6;margin-top:6px">${amount}</div>
+<div style="color:${THEME.success};font-size:11px;font-weight:600;letter-spacing:0.5px;margin-bottom:8px">● ${safeStatus}</div>
+<div style="font-size:36px;font-weight:700;color:${THEME.text};letter-spacing:-0.5px">+${escapeHtml(credits)}</div>
+<div style="font-size:13px;color:${THEME.textMuted};margin-top:6px">${escapeHtml(amount)}</div>
 </td></tr>
 
 <!-- divider -->
-<tr><td style="padding:20px 32px 0"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+<tr><td style="padding:20px 32px 0"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 
 <!-- details -->
 <tr><td style="padding:20px 32px 8px">
-<div style="color:#8A94A6;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Allocation Details</div>
+<div style="color:${THEME.textMuted};font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Allocation Details</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${detailRows}</table>
 </td></tr>
 
 <!-- divider -->
-<tr><td style="padding:0 32px"><div style="border-bottom:1px solid #1D2430"></div></td></tr>
+<tr><td style="padding:0 32px"><div style="border-bottom:1px solid ${THEME.border}"></div></td></tr>
 
 <!-- cta + footer -->
 <tr><td style="padding:20px 32px 24px;text-align:center">
-${ctaUrl ? `<a href="${ctaUrl}" style="display:inline-block;padding:10px 24px;background:#1D2430;color:#E7ECF3;font-size:13px;font-weight:500;border-radius:6px;text-decoration:none;border:1px solid #2A3345">View Receipt →</a><br><br>` : ""}
-<div style="color:#5B6380;font-size:11px">ARCANA Runtime Infrastructure · Delivered via Otnel</div>
-<div style="color:#3D4560;font-size:10px;margin-top:2px">receipts@otnelhq.com</div>
-</td></tr>
-
-</table>
-</td></tr></table>
-</body></html>`
+${ctaUrl ? `<a href="${escapeHtml(ctaUrl)}" style="display:inline-block;padding:10px 24px;background:${THEME.border};color:${THEME.text};font-size:13px;font-weight:500;border-radius:6px;text-decoration:none;border:1px solid ${THEME.borderLight}">View Receipt →</a><br><br>` : ""}
+<div style="color:${THEME.textDim};font-size:11px">ARCANA Runtime Infrastructure · Delivered via Otnel</div>
+<div style="color:${THEME.textDimmer};font-size:10px;margin-top:2px">receipts@otnelhq.com</div>
+</td></tr>`
+  return wrapInLayout("Arcana Receipt", inner)
 }
 
-function receiptText(credits: string, amount: string, details: [string, string][], status: string): string {
+function receiptText(credits: string, amount: string, details: [string, string][], status: string, receiptUrl?: string): string {
   const sep = "─".repeat(44)
   const lines = details.map(([l, v]) => `  ${l.padEnd(22)} ${v}`).join("\n")
-  return `${" ".repeat(14)}ARCANA\n${" ".repeat(10)}decrypt the arcane\n${sep}\n  ${status.toUpperCase()}\n\n  +${credits}\n  ${amount}\n${sep}\n  Allocation Details\n${sep}\n${lines}\n${sep}\n  View Receipt →  receipts.arcana.otnelhq.com\n${sep}\n  ARCANA Runtime Infrastructure  ·  Otnel`
+  const receiptLine = receiptUrl ? `\n  View Receipt →  ${receiptUrl}` : ""
+  return `${" ".repeat(14)}ARCANA\n${" ".repeat(10)}decrypt the arcane\n${sep}\n  ${status.toUpperCase()}\n\n  +${credits}\n  ${amount}\n${sep}\n  Allocation Details\n${sep}\n${lines}\n${sep}${receiptLine}\n${sep}\n  ARCANA Runtime Infrastructure  ·  Otnel`
 }
 
 async function sendReceiptEmail(env: Env, to: string, amount: number, credits: number, orderId: string): Promise<void> {

@@ -43,7 +43,22 @@
   // Until that Worker is deployed, the binding is undefined and the priority
   // list is forced to ["openrouter"] in code.
   // ---------------------------------------------------------------------------
-  "migrations": [],
+  "migrations": [
+    { "tag": "v2", "new_sqlite_classes": ["FreeUsageDO"] }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // FreeUsageDO owns the authoritative free-usage state per subject key.
+  // Added in the DO-migration scaffolding commit; the call sites in
+  // src/index.ts are gated by the FREE_USAGE_DO_ENABLED env var (default off)
+  // so this binding is present but unreached until a follow-up commit flips
+  // the flag. See docs/providers-free-usage-deploy.md "Known limits" #1 for
+  // the rationale.
+  "durable_objects": {
+    "bindings": [
+      { "name": "FREE_USAGE", "class_name": "FreeUsageDO" }
+    ]
+  },
 
   // ---------------------------------------------------------------------------
   // The container is owned by the warm Worker (`arcana-omniroute-warm`,
