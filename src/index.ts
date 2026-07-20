@@ -379,7 +379,7 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
 const FREE_SESSION_TURN_LIMIT = 10
 const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-const FREE_TURN_PROVIDER_CALL_LIMIT = 1     // 1 provider dispatch per turn-id (idempotent retries reuse the existing reservation)
+const FREE_TURN_PROVIDER_CALL_LIMIT = 2     // 2 provider dispatches per turn-id: original + one failover attempt on hard 5xx/429
 const FREE_MAX_INPUT_TOKENS = 16_384           // ~16K raw input per turn (down from 32K)
 const FREE_MAX_OUTPUT_TOKENS = 2_048           // ~2K output per turn (down from 4K); biggest single cost lever
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // unchanged
@@ -1038,9 +1038,27 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   })
   if (body.model) body.user = user.id
 
+  // Cloudflare (Workers AI) is wired as a *secondary* dispatch behind the cf/ or cloudflare/ prefix.
+  // The provider priority list is a *failover* list, not a routing list — bare model names go to the
+  // first provider in the list (openrouter today). Use the prefix to opt into cloudflare explicitly.
+  const cfPrefixed = typeof body.model === "string" && (body.model.startsWith("cf/") || body.model.startsWith("cloudflare/"))
+  if (cfPrefixed) body.model = body.model.replace(/^cloudflare\//, "").replace(/^cf\//, "")
   const startTime = Date.now()
   const isStream = body.stream === true
-  const response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(body) })
+  let response: Response
+  if (cfPrefixed) {
+    const cfKey = getCloudflareKey(env)
+    if (!cfKey || !env.CLOUDFLARE_ACCOUNT_ID) {
+      ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+      await releaseLock()
+      return json({ error: "no_api_key", message: "No Cloudflare account ID or API token configured" }, 500, responseHeaders())
+    }
+    const cfHeaders = new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${cfKey}` })
+    response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers: cfHeaders, body: JSON.stringify(body) })
+    if (!response.ok && (response.status === 429 || response.status === 401)) markCloudflareKeyRateLimited(cfKey)
+  } else {
+    response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(body) })
+  }
 
   if (!response.ok) {
     if (response.status === 429 || response.status === 401) markKeyRateLimited(openRouterKey)

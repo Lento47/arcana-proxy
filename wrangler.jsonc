@@ -28,11 +28,11 @@
     { "name": "EMAIL" }
   ],
 
-  // Cloudflare Workers AI — account ID is a public identifier, lives in `vars` (not a secret).
-  // The Workers AI Read token is set with `wrangler secret put CLOUDFLARE_KEY` (or CLOUDFLARE_KEYS).
-  "vars": {
-    "CLOUDFLARE_ACCOUNT_ID": ""
-  },
+  // Cloudflare Workers AI — set these BEFORE adding "cloudflare" to the admin priority list:
+  //   npx wrangler secret put CLOUDFLARE_KEY           # or CLOUDFLARE_KEYS for rotation
+  //   npx wrangler var put CLOUDFLARE_ACCOUNT_ID       # 32-char hex from the CF dashboard
+  // The account ID is a public identifier, lives in `vars` (not a secret).
+  // The Workers AI Read token goes via `wrangler secret put`.
 
   // ---------------------------------------------------------------------------
   // OmniRoute Durable Object binding.
@@ -89,8 +89,9 @@
       "workers_dev": true,
       "routes": [],
       "vars": {
-        "PAYPAL_SANDBOX": "true",
-        "CLOUDFLARE_ACCOUNT_ID": ""
+        "PAYPAL_SANDBOX": "true"
+        // CLOUDFLARE_ACCOUNT_ID intentionally not set in staging — add via `wrangler var put`
+        // when the staging priority list includes "cloudflare".
       },
       "kv_namespaces": [
         { "binding": "ARCANA_PROXY", "id": "8c183296c8a14bd6857b1c896e7e5c3c" },
