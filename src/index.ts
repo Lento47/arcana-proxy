@@ -773,6 +773,10 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
   }
 
   // ── 3. JWT — store only by short subject id, never by raw token ───────
+  // Web workspace uses Supabase JWT. Device-flow licenses are minted with
+  // supabaseUserId so CLI + web share the same subject for sessions/memory.
+  // We also re-link via email_account:{email} so older free account:sub rows
+  // pick up pro/enterprise tier from the linked license.
   if (key.startsWith("eyJ") && key.split(".").length === 3) {
     const jwtUser = await verifySupabaseJWT(key)
     if (jwtUser) {
@@ -780,13 +784,49 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
       if (sbUser) return sbUser
       const accountKey = `account:${jwtUser.sub}`
       const stored = await kvGetJson<any>(kv, accountKey)
-      if (stored) {
-        sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }
-        licenseCache?.set("sb:" + jwtUser.sub, sbUser)
-        return sbUser
+      let tier = String(stored?.tier || "free")
+      let linkSubjects: string[] = Array.isArray(stored?.linkSubjects) ? stored.linkSubjects.map(String) : []
+      const email = String(jwtUser.email || stored?.username || "").trim().toLowerCase()
+
+      // Link license issued by device login / billing for this email
+      if (email && kvKeyOk(`email_account:${email}`)) {
+        const idx = await kvGetJson<any>(kv, `email_account:${email}`)
+        const licenseKey = idx?.licenseKey ? String(idx.licenseKey) : ""
+        if (licenseKey && kvKeyOk(`license:${licenseKey}`)) {
+          const lic = await kvGetJson<any>(kv, `license:${licenseKey}`)
+          if (lic) {
+            const licTier = String(lic.tier || idx.tier || "pro")
+            if (licTier && licTier !== "free") tier = licTier
+            for (const cand of [lic.supabaseUserId, lic.id, lic.email, email]) {
+              const s = cand != null ? String(cand).trim() : ""
+              if (s && s !== jwtUser.sub && !linkSubjects.includes(s)) linkSubjects.push(s)
+            }
+            // Persist upgraded account so later requests skip the email lookup sometimes
+            ctx.waitUntil(
+              kvPutJson(kv, accountKey, {
+                username: email,
+                email,
+                tier,
+                licenseKey,
+                linkSubjects,
+                linkedAt: Date.now(),
+              }).then(() => undefined),
+            )
+          }
+        }
       }
-      sbUser = { id: jwtUser.sub, tier: "free" }
-      ctx.waitUntil(kvPutJson(kv, accountKey, { username: jwtUser.email, tier: "free" }).then(() => undefined))
+
+      if (!stored && !email) {
+        ctx.waitUntil(kvPutJson(kv, accountKey, { username: jwtUser.email, tier: "free" }).then(() => undefined))
+      } else if (stored && (stored.tier || "free") !== tier) {
+        ctx.waitUntil(
+          kvPutJson(kv, accountKey, { ...stored, username: email || stored.username, tier, linkSubjects }).then(() => undefined),
+        )
+      }
+
+      sbUser = { id: jwtUser.sub, tier }
+      // Attach linkSubjects on the in-process object for this request via cache
+      // (handlers re-load account for merge when needed)
       licenseCache?.set("sb:" + jwtUser.sub, sbUser)
       return sbUser
     }
@@ -2131,8 +2171,11 @@ async function handleAdminMintLicense(request: Request, env: Env, cors: Record<s
   // No expiresAt — device-flow keys are open-ended. The reverse index is
   // mirrored from the PayPal path so /v1/identity/validate-email and other
   // email-lookup routes continue to work uniformly.
+  // Subject for sessions/memory is always the Supabase user id so web JWT and
+  // CLI license key resolve to the same user.id (getUser prefers supabaseUserId).
   await env.ARCANA_PROXY.put(licenseKvKey, JSON.stringify({
-    id: email,
+    id: supabaseUserId,
+    email,
     tier: plan,
     supabaseUserId,
     source: "device_flow",
@@ -2141,9 +2184,22 @@ async function handleAdminMintLicense(request: Request, env: Env, cors: Record<s
   await env.ARCANA_PROXY.put(emailKvKey, JSON.stringify({
     licenseKey: key,
     tier: plan,
+    supabaseUserId,
     source: "device_flow",
     createdAt,
   }), { expirationTtl: 365 * 86400 })
+  // Web JWT path reads account:{sub} — keep tier in sync with the license
+  if (kvKeyOk(`account:${supabaseUserId}`)) {
+    await env.ARCANA_PROXY.put(`account:${supabaseUserId}`, JSON.stringify({
+      username: email,
+      email,
+      tier: plan,
+      licenseKey: key,
+      linkSubjects: [email],
+      source: "device_flow",
+      updatedAt: createdAt,
+    }))
+  }
   return json({ licenseKey: key, tier: plan, createdAt }, 200, cors)
 }
 
@@ -2339,12 +2395,44 @@ async function recordPurchase(userId: string, orderId: string, amount: number, c
   } catch {}
 }
 
+/** Subjects that may hold this user's sessions/memory (JWT sub + linked license ids). */
+async function resolveDataSubjects(userId: string, env: Env): Promise<string[]> {
+  const subjects = [userId]
+  const account = await env.ARCANA_PROXY.get(`account:${userId}`, "json") as any
+  if (Array.isArray(account?.linkSubjects)) {
+    for (const s of account.linkSubjects) {
+      const id = String(s || "").trim()
+      if (id && !subjects.includes(id)) subjects.push(id)
+    }
+  }
+  if (account?.licenseKey && kvKeyOk(`license:${account.licenseKey}`)) {
+    const lic = await env.ARCANA_PROXY.get(`license:${account.licenseKey}`, "json") as any
+    for (const cand of [lic?.id, lic?.email, lic?.supabaseUserId, account.email, account.username]) {
+      const id = cand != null ? String(cand).trim() : ""
+      if (id && !subjects.includes(id)) subjects.push(id)
+    }
+  }
+  return subjects
+}
+
 async function handleGetSessions(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   const url = new URL(request.url)
   const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50"), 50)
-  const raw = await env.ARCANA_PROXY.get(`user_sessions:${user.id}`, "json") as any[] || []
-  const sessions = raw.slice(0, limit)
-  return json({ sessions, total: raw.length }, 200, cors)
+  const subjects = await resolveDataSubjects(user.id, env)
+  const merged: any[] = []
+  const seen = new Set<string>()
+  for (const subject of subjects) {
+    const raw = await env.ARCANA_PROXY.get(`user_sessions:${subject}`, "json") as any[] || []
+    for (const s of raw) {
+      const id = s?.id ? String(s.id) : ""
+      if (id && seen.has(id)) continue
+      if (id) seen.add(id)
+      merged.push(s)
+    }
+  }
+  merged.sort((a, b) => String(b?.createdAt || "").localeCompare(String(a?.createdAt || "")))
+  const sessions = merged.slice(0, limit)
+  return json({ sessions, total: merged.length, subjects }, 200, cors)
 }
 
 async function handleGetSessionDetail(sessionId: string, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
@@ -2420,7 +2508,17 @@ async function handleGetMemory(request: Request, user: { id: string }, env: Env,
   const url = new URL(request.url)
   const q = (url.searchParams.get("q") ?? "").trim().toLowerCase()
   const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), MEMORY_MAX_FACTS)
-  let facts = await loadUserMemory(user.id, env.ARCANA_PROXY)
+  const subjects = await resolveDataSubjects(user.id, env)
+  const byKey = new Map<string, CloudFact>()
+  for (const subject of subjects) {
+    const list = await loadUserMemory(subject, env.ARCANA_PROXY)
+    for (const f of list) {
+      const prev = byKey.get(f.key)
+      if (!prev || String(f.updatedAt) >= String(prev.updatedAt)) byKey.set(f.key, f)
+    }
+  }
+  let facts = Array.from(byKey.values())
+  facts.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
   if (q) {
     facts = facts.filter((f) =>
       f.key.toLowerCase().includes(q) ||
@@ -2429,7 +2527,7 @@ async function handleGetMemory(request: Request, user: { id: string }, env: Env,
     )
   }
   const total = facts.length
-  return json({ facts: facts.slice(0, limit), total }, 200, cors)
+  return json({ facts: facts.slice(0, limit), total, subjects }, 200, cors)
 }
 
 async function handlePutMemory(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
