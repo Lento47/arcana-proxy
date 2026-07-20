@@ -7,6 +7,25 @@ export { OmniRouteContainer } from "./container"
 import type { OmniRouteContainer } from "./container"
 export { FreeUsageDO } from "./free-usage-do"
 import type { FreeUsageDO } from "./free-usage-do"
+import {
+  FREE_MODEL_DEFAULT,
+  FREE_MAX_INPUT_TOKENS,
+  FREE_MAX_OUTPUT_TOKENS,
+  FREE_IP_RATE_LIMIT as FREE_IP_RATE_LIMIT_CFG,
+  FREE_USER_RATE_LIMIT as FREE_USER_RATE_LIMIT_CFG,
+  FREE_GLOBAL_SOFT_RPM,
+  loadFreePools,
+  seedPoolSnapshot,
+  invalidateFreePoolCache,
+  ensureFreeModel,
+  freeModelFailoverList,
+  progressiveBudget,
+  clampBodyToBudget,
+  wantsLongContext,
+  freeGlobalAllow,
+  freeGlobalLoad,
+  type FreePoolSnapshot,
+} from "./free-routing"
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
 const AIHUBMIX_URL = "https://aihubmix.com"
@@ -312,6 +331,114 @@ function resolveProvider(model: string, priority: Provider[]): { provider: Provi
   return null
 }
 
+/** Strip provider routing prefixes from a model slug. */
+function stripProviderPrefix(model: string): string {
+  if (model.startsWith("aihubmix/")) return model.slice("aihubmix/".length)
+  if (model.startsWith("aihub/")) return model.slice("aihub/".length)
+  if (model.startsWith("or/")) return model.slice(3)
+  if (model.startsWith("omni/")) return model.slice(5)
+  if (model.startsWith("cf/")) return model.slice(3)
+  if (model.startsWith("cloudflare/")) return model.slice("cloudflare/".length)
+  return model
+}
+
+/**
+ * Map catalog / aihubmix bare model ids to OpenRouter-style org/model slugs.
+ * aihubmix catalog often lists "gpt-4o-mini" without the openai/ prefix.
+ */
+function toOpenRouterModel(model: string): string {
+  const bare = stripProviderPrefix(model).trim()
+  if (!bare) return bare
+  // Exact aliases for aihubmix catalog slugs that don't match OpenRouter 1:1
+  const aliases: Record<string, string> = {
+    "gemini-2.0-flash": "google/gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite": "google/gemini-2.0-flash-lite-001",
+    "gemini-2.5-flash": "google/gemini-2.5-flash",
+    "gemini-2.5-pro": "google/gemini-2.5-pro",
+    "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
+    "claude-3-5-sonnet": "anthropic/claude-3.5-sonnet",
+    "claude-sonnet-4": "anthropic/claude-sonnet-4",
+    "claude-opus-4": "anthropic/claude-opus-4",
+    "gpt-4o": "openai/gpt-4o",
+    "gpt-4o-mini": "openai/gpt-4o-mini",
+    "gpt-4.1": "openai/gpt-4.1",
+    "gpt-4.1-mini": "openai/gpt-4.1-mini",
+    "gpt-4.1-nano": "openai/gpt-4.1-nano",
+    "grok-4.5": "x-ai/grok-4.5",
+    "grok-3": "x-ai/grok-3",
+    "grok-3-mini": "x-ai/grok-3-mini",
+  }
+  if (aliases[bare]) return aliases[bare]!
+  if (bare.includes("/")) return bare
+  if (/^(gpt-|o[1-9]|chatgpt-|text-embedding|tts-|whisper-)/i.test(bare)) return `openai/${bare}`
+  if (/^claude/i.test(bare)) return `anthropic/${bare}`
+  if (/^gemini/i.test(bare)) return `google/${bare}`
+  if (/^grok/i.test(bare)) return `x-ai/${bare}`
+  if (/^(kimi|moonshot)/i.test(bare)) return `moonshotai/${bare}`
+  if (/^deepseek/i.test(bare)) return `deepseek/${bare}`
+  if (/^qwen/i.test(bare)) return `qwen/${bare}`
+  if (/^llama/i.test(bare)) return `meta-llama/${bare}`
+  if (/^mistral|^mixtral|^codestral/i.test(bare)) return `mistralai/${bare}`
+  if (/^command/i.test(bare)) return `cohere/${bare}`
+  return bare
+}
+
+/** Model id for a given upstream provider. */
+function modelForProvider(provider: Provider, requestedModel: string, resolvedModel: string): string {
+  if (provider === "openrouter") return toOpenRouterModel(requestedModel || resolvedModel)
+  if (provider === "aihubmix") return stripProviderPrefix(resolvedModel || requestedModel)
+  if (provider === "cloudflare") return stripProviderPrefix(resolvedModel || requestedModel)
+  if (provider === "omniroute") return stripProviderPrefix(resolvedModel || requestedModel)
+  return resolvedModel
+}
+
+/**
+ * Build failover order. Hard-force only omni/ or/ cf/ cloudflare/.
+ * aihubmix/ is a *soft* preference: try aihubmix first, then openrouter, then the rest.
+ * Catalog lists hundreds of aihubmix/* ids; exclusive force left users stranded when
+ * Aihubmix returns Azure "unsupported" or insufficient balance.
+ */
+function buildAttemptOrder(
+  requestedModel: string,
+  resolved: { provider: Provider; model: string },
+  priority: Provider[],
+  freeCap: boolean,
+): Provider[] {
+  // Free tier: OpenRouter only — never aihubmix/omni paid routes (P0 free isolation).
+  if (freeCap) {
+    return ["openrouter"]
+  }
+
+  const hardForce =
+    requestedModel.startsWith("omni/")
+    || requestedModel.startsWith("or/")
+    || requestedModel.startsWith("cf/")
+    || requestedModel.startsWith("cloudflare/")
+
+  if (hardForce) return [resolved.provider]
+
+  let order: Provider[]
+  if (requestedModel.startsWith("aihubmix/") || requestedModel.startsWith("aihub/")) {
+    order = ["aihubmix", "openrouter", ...priority.filter((p) => p !== "aihubmix" && p !== "openrouter")]
+  } else {
+    // Prefer openrouter first when both are configured — aihubmix Azure is flaky.
+    order = [...priority]
+    if (order.includes("openrouter") && order.includes("aihubmix")) {
+      order = ["openrouter", ...order.filter((p) => p !== "openrouter")]
+    }
+  }
+
+  // Dedupe preserve order
+  const seen = new Set<Provider>()
+  order = order.filter((p) => {
+    if (seen.has(p)) return false
+    seen.add(p)
+    return true
+  })
+
+  return order.length ? order : [resolved.provider]
+}
+
 // Throttled warm-up queue producer. Per-isolate, max one enqueue per 30s.
 // Fires only on the cold path (first OmniRoute call after the binding sees
 // traffic) so we don't spam the queue on warm instances.
@@ -353,9 +480,10 @@ const USER_RATE_LIMIT = 25
 // Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
 // Workspace GETs (balance, sessions, memory, profile) must not share this bucket —
 // a single dashboard load is already 3–5 parallel requests and used to 429 at 8/min.
-const FREE_IP_RATE_LIMIT = 20
-const FREE_USER_RATE_LIMIT = 12
-const FREE_BURST_PATHS = new Set(["/v1/chat/completions", "/v1/embeddings"])
+// Free burst limits — sized for ~5k free MAU (quality pool, not free-for-all)
+const FREE_IP_RATE_LIMIT = FREE_IP_RATE_LIMIT_CFG
+const FREE_USER_RATE_LIMIT = FREE_USER_RATE_LIMIT_CFG
+const FREE_BURST_PATHS = new Set(["/v1/chat/completions", "/v1/embeddings", "/v1/images/generations", "/v1/images"])
 const RATE_WINDOW = 60000
 
 // Daily usage limits by tier
@@ -389,10 +517,10 @@ const FREE_SESSION_TURN_LIMIT = 10
 const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
 const FREE_TURN_PROVIDER_CALL_LIMIT = 2     // 2 provider dispatches per turn-id: original + one failover attempt on hard 5xx/429
-const FREE_MAX_INPUT_TOKENS = 16_384           // ~16K raw input per turn (down from 32K)
-const FREE_MAX_OUTPUT_TOKENS = 2_048           // ~2K output per turn (down from 4K); biggest single cost lever
-const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // unchanged
+const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // free tier: openrouter only (never aihubmix paid routes)
 const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000    // per-subject-key combined in+out cap; reset anchored to activated_at + 7d
+
+// Free model routing lives in ./free-routing.ts (quality ranking, progressive budgets, pools)
 
 type FreeUsageState = "eligible" | "active" | "exhausted" | "expired"
 type FreeTurnStatus = "admitted" | "completed" | "failed"
@@ -511,12 +639,38 @@ function freeConversationId(request: Request, body: any): string {
 }
 
 
-function clampFreeRequestBody(body: any): any {
-  const next = { ...body }
-  if (Number(next.max_tokens) > FREE_MAX_OUTPUT_TOKENS) next.max_tokens = FREE_MAX_OUTPUT_TOKENS
-  if (Number(next.max_completion_tokens) > FREE_MAX_OUTPUT_TOKENS) next.max_completion_tokens = FREE_MAX_OUTPUT_TOKENS
-  if (next.max_tokens === undefined && next.max_completion_tokens === undefined) next.max_tokens = FREE_MAX_OUTPUT_TOKENS
-  return next
+function clampFreeRequestBody(body: any, budget?: { maxOutputTokens: number }): any {
+  return clampBodyToBudget(body, {
+    maxInputTokens: budget?.maxOutputTokens ? FREE_MAX_INPUT_TOKENS : FREE_MAX_INPUT_TOKENS,
+    maxOutputTokens: budget?.maxOutputTokens ?? FREE_MAX_OUTPUT_TOKENS,
+    tier: "standard",
+    reason: "clamp",
+  })
+}
+
+/** Catalog fetch for free pool discovery (OpenRouter models only — free path). */
+async function fetchOpenRouterModelsForPool(env: Env): Promise<any[]> {
+  const key = getOpenRouterKey(env)
+  if (!key) return []
+  try {
+    const response = await fetch(`${OPENROUTER_URL}/v1/models`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(20_000),
+    })
+    if (!response.ok) return []
+    const data = await response.json() as any
+    return Array.isArray(data?.data) ? data.data : []
+  } catch {
+    return []
+  }
+}
+
+async function getFreePool(env: Env, force = false): Promise<FreePoolSnapshot> {
+  try {
+    return await loadFreePools(env.ARCANA_PROXY, () => fetchOpenRouterModelsForPool(env), { force })
+  } catch {
+    return seedPoolSnapshot()
+  }
 }
 
 async function readFreeUsageRecord(userId: string, kv: KVNamespace): Promise<{ key: string; record: FreeUsageRecord | null }> {
@@ -985,9 +1139,12 @@ export default {
     const url = new URL(request.url)
     const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
     const origin = request.headers.get("Origin") || ""
-    const allowedOrigin = origin === "https://arcana.otnelhq.com" || /^https?:\/\/localhost(:\d+)?$/.test(origin)
-      ? origin
-      : "https://arcana.otnelhq.com"
+    const allowedOrigin =
+      origin === "https://arcana.otnelhq.com"
+      || origin === "https://www.arcana.otnelhq.com"
+      || /^https?:\/\/localhost(:\d+)?$/.test(origin)
+        ? origin
+        : "https://arcana.otnelhq.com"
     const corsHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -1056,10 +1213,27 @@ export default {
       // Free-tier burst limits only on LLM routes (chat/embeddings). Workspace
       // reads (balance/sessions/memory/profile) stay under the general 25/min cap.
       if (user.tier === "free" && isLlmPath) {
+        // Global soft brake (~5k free users peak safety; isolate-local)
+        if (!freeGlobalAllow(FREE_GLOBAL_SOFT_RPM)) {
+          return arcanaErrorResponse(429, "free global soft rate limit", {
+            code: "ARC_RATE_LIMITED",
+            cors: corsHeaders,
+          })
+        }
         const freeIpRl = checkRateLimit(`free:${clientIp}`, freeIpLimits, FREE_IP_RATE_LIMIT)
-        if (!freeIpRl.allowed) return json({ error: "rate_limited", message: "Free IP burst limit exceeded: 20 req/min" }, 429, corsHeaders)
+        if (!freeIpRl.allowed) {
+          return arcanaErrorResponse(429, `Free IP burst limit exceeded: ${FREE_IP_RATE_LIMIT} req/min`, {
+            code: "ARC_RATE_LIMITED",
+            cors: corsHeaders,
+          })
+        }
         const freeUserRl = checkRateLimit(`free:${user.id}`, freeUserLimits, FREE_USER_RATE_LIMIT)
-        if (!freeUserRl.allowed) return json({ error: "rate_limited", message: `Free user burst limit exceeded: ${FREE_USER_RATE_LIMIT} req/min` }, 429, corsHeaders)
+        if (!freeUserRl.allowed) {
+          return arcanaErrorResponse(429, `Free user burst limit exceeded: ${FREE_USER_RATE_LIMIT} req/min`, {
+            code: "ARC_RATE_LIMITED",
+            cors: corsHeaders,
+          })
+        }
       }
 
       // Daily usage limit (per-tier) — only count LLM traffic, not dashboard polls
@@ -1098,12 +1272,75 @@ export default {
         case "/v1/chat/completions":
         case "/v1/embeddings":
           return proxyWithFailover(request, env, user, corsHeaders, url.pathname, ctx)
+        case "/v1/images/generations":
+        case "/v1/images":
+          if (request.method === "POST") return handleImageGeneration(request, env, user, corsHeaders, ctx)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/models":
           return listModels(env, corsHeaders)
         case "/v1/usage":
           return getUserUsage(user, env, corsHeaders)
         case "/v1/free-usage/sessions/current":
           if (request.method === "GET") return getFreeUsageCurrent(user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/free/models":
+          if (request.method === "GET") {
+            const pool = await getFreePool(env)
+            return json({
+              defaultModel: pool.defaultModel,
+              updatedAt: pool.updatedAt,
+              free: pool.free.slice(0, 40).map((m) => ({
+                id: m.id,
+                qualityScore: m.qualityScore,
+                contextLength: m.contextLength,
+                longContext: m.longContext,
+                megaContext: m.megaContext,
+                chinese: m.chinese,
+                coding: m.coding,
+              })),
+              freeLong: pool.freeLong.slice(0, 15).map((m) => ({
+                id: m.id,
+                qualityScore: m.qualityScore,
+                contextLength: m.contextLength,
+                chinese: m.chinese,
+              })),
+              // Paid CN long-context (Pro reference only — not free-routable)
+              paidLongChinesePreview: user.tier === "free"
+                ? pool.paidLongChinese.slice(0, 5).map((m) => ({ id: m.id, contextLength: m.contextLength }))
+                : pool.paidLongChinese.slice(0, 25).map((m) => ({
+                    id: m.id,
+                    qualityScore: m.qualityScore,
+                    contextLength: m.contextLength,
+                    promptPrice: m.promptPrice,
+                  })),
+              policy: {
+                freeModelsOnly: true,
+                progressiveBudgets: true,
+                freeUserRpm: FREE_USER_RATE_LIMIT,
+                freeIpRpm: FREE_IP_RATE_LIMIT,
+                freeGlobalSoftRpm: FREE_GLOBAL_SOFT_RPM,
+              },
+            }, 200, corsHeaders)
+          }
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/free/models/refresh":
+          // Authenticated refresh of free pool classification (any licensed user ok; rate limited)
+          if (request.method === "POST") {
+            try {
+              await env.ARCANA_PROXY.delete("free:model_pools")
+            } catch {}
+            invalidateFreePoolCache()
+            const pool = await getFreePool(env, true)
+            return json({
+              ok: true,
+              free: pool.free.length,
+              freeLong: pool.freeLong.length,
+              paidLongChinese: pool.paidLongChinese.length,
+              defaultModel: pool.defaultModel,
+              topFree: pool.free.slice(0, 8).map((m) => m.id),
+              updatedAt: pool.updatedAt,
+            }, 200, corsHeaders)
+          }
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/balance":
           return handleGetBalance(user, env, corsHeaders)
@@ -1133,8 +1370,14 @@ export default {
             user: user.id,
             tier: user.tier,
             // Build marker so we can verify deploy (workspace GETs must not free-burst)
-            build: "2026-07-20-rl-workspace",
-            freeBurstOnly: ["/v1/chat/completions", "/v1/embeddings"],
+            build: "2026-07-20-free-quality-v2",
+            freeBurstOnly: ["/v1/chat/completions", "/v1/embeddings", "/v1/images/generations", "/v1/images"],
+            imageGeneration: true,
+            freeModelsOnly: true,
+            freeModelDefault: FREE_MODEL_DEFAULT,
+            freeGlobalSoftRpm: FREE_GLOBAL_SOFT_RPM,
+            freeUserRpm: FREE_USER_RATE_LIMIT,
+            freeIpRpm: FREE_IP_RATE_LIMIT,
           }, 200, corsHeaders)
         default:
           return json({ error: "not_found" }, 404, corsHeaders)
@@ -1229,7 +1472,11 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
     ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
     await releaseLock()
     const errorBody = await response.text()
-    return json({ error: "upstream_error", message: errorBody.slice(0, 100) }, response.status, responseHeaders())
+    return arcanaErrorResponse(response.status, errorBody, {
+      provider: cfPrefixed ? "cloudflare" : "openrouter",
+      model: typeof body.model === "string" ? body.model : undefined,
+      cors: responseHeaders(),
+    })
   }
   markKeySuccess(openRouterKey)
 
@@ -1300,6 +1547,263 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
   } catch { return null }
 }
 
+/**
+ * Strip OpenAI Responses / Azure-only knobs that break plain /v1/chat/completions.
+ * Aihubmix (often Azure-backed) returns 400 "The requested operation is unsupported"
+ * when these leak through from the Responses SDK path.
+ */
+function sanitizeChatCompletionsBody(body: any, provider: Provider): any {
+  if (!body || typeof body !== "object") return body
+  const out: any = { ...body }
+  // Never forward Responses-only include / store flags on chat completions.
+  delete out.include
+  delete out.store
+  delete out.previous_response_id
+  delete out.reasoning
+  delete out.text
+  // Azure/Aihubmix often rejects metadata / service_tier / prompt_cache_key
+  if (provider === "aihubmix" || provider === "omniroute" || provider === "cloudflare") {
+    delete out.metadata
+    delete out.service_tier
+    delete out.prompt_cache_key
+    delete out.safety_identifier
+  }
+  return out
+}
+
+function isUnsupportedOperationError(status: number, bodyText: string): boolean {
+  if (status !== 400 && status !== 404 && status !== 422) return false
+  return /unsupported|not supported|invalid.*operation|operation is not/i.test(bodyText || "")
+}
+
+/** Provider-side failures that should try the next upstream (not user prompt bugs). */
+function isFailoverableProviderError(status: number, bodyText: string, provider?: Provider): boolean {
+  if (status >= 500 || status === 429 || status === 401 || status === 402 || status === 403) return true
+  if (isUnsupportedOperationError(status, bodyText)) return true
+  // Aihubmix balance / quota / routing — fall over to OpenRouter rather than strand the user
+  if (/insufficient|balance|recharge|quota|billing|credits?/i.test(bodyText || "")) return true
+  if (/no_available_channel|cannot be routed|no channel|no endpoints found|model.?not.?found|does not exist|unknown model/i.test(bodyText || "")) return true
+  // Aihubmix is Azure-backed and flaky; any 4xx there is worth trying OpenRouter.
+  if (provider === "aihubmix" && status >= 400 && status < 500) return true
+  return false
+}
+
+/**
+ * Arcana error envelope — user message is brand voice; internal is for logs/support.
+ * Codes align with monorepo packages/engine/src/error (docs/architecture/arcana-error-taxonomy.md).
+ */
+type ArcanaErrorCode =
+  | "ARC_AUTH_REQUIRED"
+  | "ARC_AUTH_INVALID"
+  | "ARC_CREDITS_EXHAUSTED"
+  | "ARC_QUOTA_DAILY"
+  | "ARC_RATE_LIMITED"
+  | "ARC_MODEL_UNSUPPORTED"
+  | "ARC_MODEL_NOT_FOUND"
+  | "ARC_PROVIDER_UNAVAILABLE"
+  | "ARC_PROVIDER_BALANCE"
+  | "ARC_CONTEXT_OVERFLOW"
+  | "ARC_NETWORK"
+  | "ARC_REQUEST_INVALID"
+  | "ARC_ALL_PROVIDERS_FAILED"
+  | "ARC_IMAGE_FAILED"
+  | "ARC_FREE_MODEL_ONLY"
+  | "ARC_FREE_EXHAUSTED"
+  | "ARC_INTERNAL"
+
+const ARC_USER: Record<ArcanaErrorCode, { message: string; recovery: string[]; retryable: boolean }> = {
+  ARC_AUTH_REQUIRED: {
+    message: "Arcana needs you to sign in before this request can continue.",
+    recovery: ["Run `arcana console login`", "Or set ARCANA_PROXY_KEY"],
+    retryable: false,
+  },
+  ARC_AUTH_INVALID: {
+    message: "Your Arcana session or license key was rejected.",
+    recovery: ["Sign out and run `arcana console login` again"],
+    retryable: false,
+  },
+  ARC_CREDITS_EXHAUSTED: {
+    message: "No Arcana credits remaining for this account.",
+    recovery: ["Top up with `arcana proxy buy` or workspace billing"],
+    retryable: false,
+  },
+  ARC_QUOTA_DAILY: {
+    message: "Daily request limit reached for your plan.",
+    recovery: ["Wait until the daily reset (UTC)", "Upgrade plan for higher capacity"],
+    retryable: false,
+  },
+  ARC_RATE_LIMITED: {
+    message: "Too many requests — Arcana is slowing this account briefly.",
+    recovery: ["Wait a few seconds and retry"],
+    retryable: true,
+  },
+  ARC_MODEL_UNSUPPORTED: {
+    message: "This model cannot run that operation through Arcana right now.",
+    recovery: [
+      "Switch to a standard chat model (e.g. openai/gpt-4o-mini)",
+      "For images use image generation, not chat",
+      "Prefix with or/ to force OpenRouter",
+    ],
+    retryable: false,
+  },
+  ARC_MODEL_NOT_FOUND: {
+    message: "That model id is not available on any configured route.",
+    recovery: ["Pick a catalog model", "Try openai/gpt-4o-mini"],
+    retryable: false,
+  },
+  ARC_PROVIDER_UNAVAILABLE: {
+    message: "A backend route is temporarily unavailable. Arcana could not complete the call.",
+    recovery: ["Retry in a moment", "Try another model"],
+    retryable: true,
+  },
+  ARC_PROVIDER_BALANCE: {
+    message: "An upstream route is out of capacity. Arcana tried alternate routes when possible.",
+    recovery: ["Retry", "Use an or/ OpenRouter model explicitly"],
+    retryable: true,
+  },
+  ARC_CONTEXT_OVERFLOW: {
+    message: "This conversation is too large for the selected model.",
+    recovery: ["Compact or start a new session", "Switch to a larger-context model"],
+    retryable: false,
+  },
+  ARC_NETWORK: {
+    message: "Network error talking to Arcana services.",
+    recovery: ["Check connectivity", "Retry"],
+    retryable: true,
+  },
+  ARC_REQUEST_INVALID: {
+    message: "The request was invalid and could not be processed.",
+    recovery: ["Check model and parameters", "Retry with a simpler request"],
+    retryable: false,
+  },
+  ARC_ALL_PROVIDERS_FAILED: {
+    message: "All available model routes failed for this request.",
+    recovery: ["Retry shortly", "Change model", "Check credits and proxy health"],
+    retryable: true,
+  },
+  ARC_IMAGE_FAILED: {
+    message: "Image generation failed.",
+    recovery: ["Retry with a shorter prompt", "Check credits"],
+    retryable: true,
+  },
+  ARC_FREE_MODEL_ONLY: {
+    message: "Free accounts use community free models only. Your request was remapped or blocked for a paid model.",
+    recovery: [
+      "Use a free model (openrouter/free or any id ending in :free)",
+      "Upgrade to Pro for full model catalog",
+    ],
+    retryable: false,
+  },
+  ARC_FREE_EXHAUSTED: {
+    message: "Your free weekly session is used up (turns, time window, or token allowance).",
+    recovery: [
+      "Wait until free reset (see X-Arcana-Free-Reset-At)",
+      "Upgrade to Pro for more capacity",
+    ],
+    retryable: false,
+  },
+  ARC_INTERNAL: {
+    message: "Something went wrong inside Arcana.",
+    recovery: ["Retry", "Report with code ARC_INTERNAL if it continues"],
+    retryable: true,
+  },
+}
+
+function classifyUpstream(status: number, bodyText: string): ArcanaErrorCode {
+  const msg = (bodyText || "").toLowerCase()
+  if (status === 401) return msg.includes("invalid") || msg.includes("expired") ? "ARC_AUTH_INVALID" : "ARC_AUTH_REQUIRED"
+  if (status === 402 || msg.includes("insufficient_balance") || (msg.includes("credit") && msg.includes("insufficient"))) {
+    return "ARC_CREDITS_EXHAUSTED"
+  }
+  if (msg.includes("recharge your account") || (msg.includes("account balance is insufficient"))) return "ARC_PROVIDER_BALANCE"
+  if (status === 429 || msg.includes("rate_limited") || msg.includes("rate limit")) {
+    return msg.includes("daily") ? "ARC_QUOTA_DAILY" : "ARC_RATE_LIMITED"
+  }
+  if (msg.includes("unsupported") || msg.includes("requested operation") || msg.includes("not supported")) {
+    return "ARC_MODEL_UNSUPPORTED"
+  }
+  if (msg.includes("no endpoints found") || msg.includes("not a valid model") || msg.includes("model_not_found")) {
+    return "ARC_MODEL_NOT_FOUND"
+  }
+  if (msg.includes("no_available_channel") || msg.includes("cannot be routed") || msg.includes("no channel")) {
+    return "ARC_PROVIDER_UNAVAILABLE"
+  }
+  if (msg.includes("context") && (msg.includes("exceed") || msg.includes("too long"))) return "ARC_CONTEXT_OVERFLOW"
+  if (msg.includes("image_generation") || msg.includes("empty_image")) return "ARC_IMAGE_FAILED"
+  if (msg.includes("all_providers_failed")) return "ARC_ALL_PROVIDERS_FAILED"
+  if (msg.includes("free") && (msg.includes("exhaust") || msg.includes("allowance") || msg.includes("weekly"))) {
+    return "ARC_FREE_EXHAUSTED"
+  }
+  if (status >= 500 || status === 408 || status === 502 || status === 503 || status === 504) return "ARC_PROVIDER_UNAVAILABLE"
+  if (status === 400 || status === 422) return "ARC_REQUEST_INVALID"
+  return "ARC_INTERNAL"
+}
+
+function extractTid(text: string): string | undefined {
+  const m = text.match(/tid:\s*(\d{10,})/i)
+  return m?.[1]
+}
+
+function arcanaErrorResponse(
+  status: number,
+  bodyText: string,
+  meta: {
+    provider?: string
+    providers?: string[]
+    model?: string
+    code?: ArcanaErrorCode
+    cors?: Record<string, string>
+  } = {},
+): Response {
+  const code = meta.code ?? classifyUpstream(status, bodyText)
+  const cat = ARC_USER[code]
+  const httpStatus =
+    code === "ARC_AUTH_REQUIRED" || code === "ARC_AUTH_INVALID" ? 401
+    : code === "ARC_CREDITS_EXHAUSTED" ? 402
+    : code === "ARC_RATE_LIMITED" || code === "ARC_QUOTA_DAILY" ? 429
+    : code === "ARC_MODEL_NOT_FOUND" ? 404
+    : code === "ARC_MODEL_UNSUPPORTED" || code === "ARC_REQUEST_INVALID" || code === "ARC_CONTEXT_OVERFLOW" ? 400
+    : status >= 400 && status < 600 ? status
+    : 502
+
+  const payload = {
+    error: {
+      code,
+      type:
+        code.startsWith("ARC_AUTH") ? "auth"
+        : code.includes("QUOTA") || code.includes("CREDITS") || code === "ARC_PROVIDER_BALANCE" || code === "ARC_FREE_EXHAUSTED" ? "quota"
+        : code === "ARC_RATE_LIMITED" ? "rate_limit"
+        : code.includes("MODEL") || code === "ARC_CONTEXT_OVERFLOW" || code === "ARC_FREE_MODEL_ONLY" ? "model"
+        : code.includes("NETWORK") ? "network"
+        : code === "ARC_REQUEST_INVALID" ? "request"
+        : code.includes("PROVIDER") || code.includes("IMAGE") || code.includes("ALL_PROVIDERS") ? "provider"
+        : "internal",
+      message: cat.message,
+      recovery: cat.recovery,
+      retryable: cat.retryable,
+    },
+    internal: {
+      provider: meta.provider,
+      providersAttempted: meta.providers,
+      upstreamStatus: status,
+      upstreamMessage: (bodyText || "").slice(0, 500),
+      model: meta.model,
+      tid: extractTid(bodyText || ""),
+    },
+    // Legacy top-level fields (older clients / logs)
+    message: cat.message,
+    provider: meta.provider,
+    model: meta.model,
+  }
+  return json(payload, httpStatus, meta.cors)
+}
+
+function humanizeUpstreamError(provider: string, status: number, bodyText: string): string {
+  // Kept for log lines; user-facing path uses arcanaErrorResponse.
+  const code = classifyUpstream(status, bodyText)
+  return `[${code}] ${provider}: ${(bodyText || "").slice(0, 160)}`
+}
+
 // --- Multi-provider failover wrapper ---
 // Mirrors proxyOpenRouter's flow (lock, balance, upstream call, stream handling)
 // but routes through the priority list with hard-failure failover. Bare model
@@ -1308,18 +1812,38 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
 async function proxyWithFailover(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
   let body = await request.json() as any
   if (!body.model) return json({ error: "model_required" }, 400, cors)
-  const requestedModel = String(body.model)
+  const originalRequestedModel = String(body.model)
+  let requestedModel = originalRequestedModel
+  let freeModelRemap: { from: string; to: string } | undefined
+  let freePool: FreePoolSnapshot | undefined
+  let freeBudget: ReturnType<typeof progressiveBudget> | undefined
+  const preferLong =
+    user.tier === "free"
+    && path === "/v1/chat/completions"
+    && wantsLongContext(body, request.headers.get("x-arcana-need-long"))
+
+  // Free tier: quality-ranked free pool + optional free-long when request is large
+  if (user.tier === "free" && path === "/v1/chat/completions") {
+    freePool = await getFreePool(env)
+    const ensured = ensureFreeModel(requestedModel, freePool, { preferLong })
+    freeModelRemap = ensured.remapped || ensured.model !== stripProviderPrefix(originalRequestedModel)
+      ? { from: ensured.from, to: ensured.model }
+      : undefined
+    requestedModel = ensured.model
+    body = { ...body, model: ensured.model }
+  }
 
   const priority = await getProviderPriority(env, ctx)
   const resolved = resolveProvider(requestedModel, priority)
   if (!resolved) return json({ error: "no_provider_available" }, 503, cors)
 
-  // Forced via prefix — run only that provider. Otherwise walk the list.
-  const isForced = requestedModel.startsWith("omni/") || requestedModel.startsWith("or/") || requestedModel.startsWith("aihubmix/") || requestedModel.startsWith("aihub/")
-  let attemptOrder: Provider[] = isForced ? [resolved.provider] : priority
-  if (user.tier === "free" && !isForced && attemptOrder.length > FREE_PROVIDER_ATTEMPT_LIMIT) {
-    attemptOrder = attemptOrder.slice(0, FREE_PROVIDER_ATTEMPT_LIMIT)
-  }
+  // Free: openrouter only. Paid: soft aihubmix + openrouter failover.
+  const attemptOrder = buildAttemptOrder(
+    requestedModel,
+    resolved,
+    priority,
+    user.tier === "free",
+  )
 
   // Pre-flight: if all providers we might use are missing, fail fast.
   if (attemptOrder.includes("openrouter") && !getOpenRouterKey(env)) {
@@ -1339,7 +1863,8 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   // agnostic (it's a USD figure tied to the model), so we use the bare model
   // string for the estimate. Pre-deduct happens up front; refund on total fail.
   const inputTokens = body.messages?.reduce((a: number, m: any) => a + (m.content?.length ?? 0) / 4, 0) ?? 500
-  const maxCost = estimateCost(resolved.model, Math.min(inputTokens, 128000), 2000)
+  // Free models: no credit hold (billableTier excludes free)
+  const maxCost = user.tier === "free" ? 0 : estimateCost(resolved.model, Math.min(inputTokens, 128000), 2000)
   const margin = 1.4
 
   // Per-user lock (same pattern as proxyOpenRouter)
@@ -1358,15 +1883,43 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   }
 
   let freeAdmission: FreeTurnAdmission | undefined
-  const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) })
+  const responseHeaders = () => {
+    const h = { ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) }
+    if (freeModelRemap) {
+      h["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}→${freeModelRemap.to}`
+      h["X-Arcana-Free-Model"] = freeModelRemap.to
+    }
+    if (freeBudget) {
+      h["X-Arcana-Free-Budget-Tier"] = freeBudget.tier
+      h["X-Arcana-Free-Budget-In"] = String(freeBudget.maxInputTokens)
+      h["X-Arcana-Free-Budget-Out"] = String(freeBudget.maxOutputTokens)
+      h["X-Arcana-Free-Budget-Reason"] = freeBudget.reason
+    }
+    if (preferLong) h["X-Arcana-Free-Prefer-Long"] = "1"
+    h["X-Arcana-Free-Global-Load"] = String(freeGlobalLoad())
+    return h
+  }
   try {
     if (user.tier === "free") {
       freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
       if (!freeAdmission.allowed) {
         await releaseLock()
-        return json({ error: freeAdmission.error, message: freeAdmission.message, freeUsage: freeAdmission.snapshot }, 429, responseHeaders())
+        return arcanaErrorResponse(429, freeAdmission.message || freeAdmission.error || "free exhausted", {
+          code: "ARC_FREE_EXHAUSTED",
+          cors: responseHeaders(),
+        })
       }
-      body = clampFreeRequestBody(body)
+      // Progressive tokens: expand only when free session is healthy (quality-first)
+      const snap = freeAdmission.snapshot
+      freeBudget = progressiveBudget({
+        turnsUsed: snap.used,
+        turnsLimit: snap.limit,
+        tokensUsed: snap.tokensUsed,
+        tokensLimit: snap.tokensLimit,
+        preferLong,
+      })
+      // Clamp output; oversized input already blocked in reserveFreeTurn at FREE_MAX_INPUT
+      body = clampFreeRequestBody(body, freeBudget)
     } else if (billableTier(user.tier)) {
       const balance = await getBalance(user.id, env.ARCANA_PROXY)
       if (balance < maxCost) { await releaseLock(); return json({ error: "insufficient_balance", message: "Add credits via arcana proxy buy", balance, required: Math.round(maxCost) }, 402, cors) }
@@ -1378,6 +1931,25 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   let attemptedProviders: Provider[] = []
   let lastErrorStatus = 500
   let lastErrorBody = "no_attempt"
+  // Free→free model pool: quality-ranked failover (long pool first if preferLong)
+  const freeModelCandidates =
+    user.tier === "free" && path === "/v1/chat/completions"
+      ? [
+          requestedModel,
+          ...freeModelFailoverList(
+            requestedModel,
+            freePool ?? seedPoolSnapshot(),
+            4,
+            preferLong,
+          ),
+        ]
+      : [requestedModel]
+
+  for (const freeModelCandidate of freeModelCandidates) {
+  if (user.tier === "free") {
+    requestedModel = freeModelCandidate
+    body = { ...body, model: freeModelCandidate }
+  }
 
   for (const provider of attemptOrder) {
     attemptedProviders.push(provider)
@@ -1388,7 +1960,11 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
 
     let response: Response
     let providerKey: string | null = null
-    let upstreamModel = resolved.model
+    let upstreamModel = modelForProvider(provider, requestedModel, resolved.model)
+    if (user.tier === "free") {
+      // Free always uses the free candidate slug on OpenRouter (no aihubmix remap)
+      upstreamModel = stripProviderPrefix(freeModelCandidate)
+    }
     try {
       if (provider === "openrouter") {
         providerKey = getOpenRouterKey(env)
@@ -1399,7 +1975,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           "HTTP-Referer": "https://arcana.otnelhq.com",
           "X-Title": "arcana",
         })
-        const outbound = { ...body, model: upstreamModel, user: user.id }
+        const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
       } else if (provider === "aihubmix") {
         providerKey = getAIHubMixKey(env)
@@ -1408,7 +1984,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           "Content-Type": "application/json",
           Authorization: `Bearer ${providerKey}`,
         })
-        const outbound = { ...body, model: upstreamModel, user: user.id }
+        const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         response = await fetchAIHubMix(path, { method: "POST", headers, body: JSON.stringify(outbound) })
       } else if (provider === "cloudflare") {
         providerKey = getCloudflareKey(env)
@@ -1417,7 +1993,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           "Content-Type": "application/json",
           Authorization: `Bearer ${providerKey}`,
         })
-        const outbound = { ...body, model: upstreamModel, user: user.id }
+        const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
       } else {
         providerKey = getOmniKey(env)
@@ -1432,7 +2008,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           "Content-Type": "application/json",
           Authorization: `Bearer ${providerKey}`,
         })
-        const outbound = { ...body, model: upstreamModel, user: user.id }
+        const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         const innerReq = new Request(`https://omniroute.local${path}`, {
           method: "POST",
           headers,
@@ -1452,33 +2028,63 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       continue
     }
 
-    // Hard-fail check: 5xx, 429, 401 → try next. Other 4xx = client bug, no failover.
+    // Failover on 5xx/429/401 and provider-side 400s (unsupported / balance).
     if (!response.ok) {
-      const hardFail = response.status >= 500 || response.status === 429 || response.status === 401
+      const errorBody = await response.text()
+      const hardFail = isFailoverableProviderError(response.status, errorBody, provider)
       if (hardFail) {
-        if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
-        if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
-        if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
-        if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
-        const errorBody = await response.text()
+        // Only rotate keys on auth/rate issues — not on model "unsupported"
+        if (response.status === 429 || response.status === 401) {
+          if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
+          if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+          if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
+          if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
+        }
         lastErrorStatus = response.status
-        lastErrorBody = errorBody.slice(0, 200)
-        console.error(`provider ${provider} hard-fail`, response.status, errorBody.slice(0, 200))
-        // Last provider in the list — don't loop forever.
-        if (attemptedProviders.length >= attemptOrder.length) {
+        lastErrorBody = humanizeUpstreamError(provider, response.status, errorBody)
+        console.error(
+          `provider ${provider} hard-fail model=${upstreamModel}`,
+          response.status,
+          errorBody.slice(0, 200),
+        )
+        // Last provider for this model candidate — free tier may try next free model.
+        if (provider === attemptOrder[attemptOrder.length - 1]) {
+          if (user.tier === "free" && freeModelCandidates.indexOf(freeModelCandidate) < freeModelCandidates.length - 1) {
+            break // next freeModelCandidate
+          }
           if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
           ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
           await releaseLock()
-          return json({ error: "upstream_error", provider, message: lastErrorBody }, lastErrorStatus, responseHeaders())
+          return arcanaErrorResponse(lastErrorStatus, lastErrorBody, {
+            provider,
+            providers: attemptedProviders,
+            model: upstreamModel,
+            code: "ARC_ALL_PROVIDERS_FAILED",
+            cors: responseHeaders(),
+          })
         }
         continue
       } else {
-        // Client-side error (400, 404, etc.) — bubble up as-is, refund nothing.
+        // Model-not-found on free: try next free model instead of hard fail
+        if (
+          user.tier === "free"
+          && (response.status === 400 || response.status === 404)
+          && /no endpoints|not a valid model|model_not_found|not found/i.test(errorBody)
+          && freeModelCandidates.indexOf(freeModelCandidate) < freeModelCandidates.length - 1
+        ) {
+          lastErrorStatus = response.status
+          lastErrorBody = errorBody
+          break
+        }
+        // True client-side error — bubble up, refund.
         if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
         ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
         await releaseLock()
-        const errorBody = await response.text()
-        return json({ error: "upstream_error", provider, message: errorBody.slice(0, 200) }, response.status, responseHeaders())
+        return arcanaErrorResponse(response.status, errorBody, {
+          provider,
+          model: upstreamModel,
+          cors: responseHeaders(),
+        })
       }
     }
 
@@ -1571,15 +2177,25 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     const settledOut = data?.usage ? (data.usage.completion_tokens ?? data.usage.output_tokens ?? 0) : 0
     ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, settledIn, settledOut))
     await releaseLock()
-    const successHeaders = { ...responseHeaders(), "X-Provider": provider }
+    const successHeaders: Record<string, string> = { ...responseHeaders(), "X-Provider": provider }
+    if (user.tier === "free") {
+      successHeaders["X-Arcana-Free-Model"] = upstreamModel
+      if (freeModelRemap) successHeaders["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}→${upstreamModel}`
+    }
     return json(data, response.status, successHeaders)
-  }
+  } // end provider loop
+  } // end freeModelCandidates loop
 
-  // All providers in attemptOrder failed.
+  // All providers / free models failed.
   if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
   ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
   await releaseLock()
-  return json({ error: "all_providers_failed", providers: attemptedProviders, lastStatus: lastErrorStatus, message: lastErrorBody }, 502, responseHeaders())
+  return arcanaErrorResponse(lastErrorStatus, lastErrorBody, {
+    provider: attemptedProviders[attemptedProviders.length - 1],
+    providers: attemptedProviders,
+    code: "ARC_ALL_PROVIDERS_FAILED",
+    cors: responseHeaders(),
+  })
 }
 // --- end multi-provider failover ---
 
@@ -2393,6 +3009,241 @@ async function recordPurchase(userId: string, orderId: string, amount: number, c
     if (raw.length > 100) raw.length = 100
     await kv.put(`user_purchases:${userId}`, JSON.stringify(raw), { expirationTtl: 86400 * 365 })
   } catch {}
+}
+
+/** Image cost floor in credits when upstream omits usage.cost. 100 credits = $1. */
+const IMAGE_COST_CREDITS_DEFAULT = 5
+const IMAGE_N_MAX = 4
+const IMAGE_B64_MAX_CHARS = 12_000_000
+
+/**
+ * Image generation:
+ * - OpenRouter: POST /api/v1/images  { model, prompt, n, size? }
+ * - Aihubmix:   POST /v1/images/generations  (OpenAI-compatible)
+ * Client paths: /v1/images/generations and /v1/images
+ */
+async function handleImageGeneration(
+  request: Request,
+  env: Env,
+  user: { id: string; tier: string },
+  cors: Record<string, string>,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  // Free tier: no paid image gen (P0 — image stays credits/Pro)
+  if (user.tier === "free") {
+    return arcanaErrorResponse(402, "free tier image blocked", {
+      code: "ARC_FREE_MODEL_ONLY",
+      cors,
+    })
+  }
+  let body: any
+  try {
+    body = await request.json()
+  } catch {
+    return json({ error: "invalid_json" }, 400, cors)
+  }
+  const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : ""
+  if (!prompt) return json({ error: "prompt_required" }, 400, cors)
+  if (prompt.length > 4000) return json({ error: "prompt_too_long", message: "Max 4000 characters" }, 400, cors)
+
+  const requestedModel = String(body?.model || "openai/gpt-5-image").trim()
+  const n = Math.min(Math.max(parseInt(String(body?.n ?? "1"), 10) || 1, 1), IMAGE_N_MAX)
+  const size = typeof body?.size === "string" ? body.size : undefined
+  const quality = typeof body?.quality === "string" ? body.quality : undefined
+  const resolution = typeof body?.resolution === "string" ? body.resolution : undefined
+  // Accept named ratios (landscape|portrait|square) or explicit "16:9" style
+  const aspectRatioRaw = typeof body?.aspect_ratio === "string" ? body.aspect_ratio.trim() : undefined
+  const aspectRatio = aspectRatioRaw
+    ? ({ landscape: "16:9", portrait: "9:16", square: "1:1" } as Record<string, string>)[aspectRatioRaw.toLowerCase()]
+      ?? aspectRatioRaw
+    : undefined
+  const responseFormat = body?.response_format === "url" ? "url" : "b64_json"
+
+  const priority = await getProviderPriority(env, ctx)
+  const resolved = resolveProvider(requestedModel, priority)
+  if (!resolved) return json({ error: "model_required" }, 400, cors)
+
+  const isForced =
+    requestedModel.startsWith("aihubmix/") ||
+    requestedModel.startsWith("aihub/") ||
+    requestedModel.startsWith("or/")
+  let attemptOrder: Provider[] = isForced
+    ? [resolved.provider]
+    : (["openrouter", "aihubmix"] as Provider[]).filter(
+        (p) => priority.includes(p) || p === resolved.provider,
+      )
+  if (!attemptOrder.length) {
+    attemptOrder = [resolved.provider === "openrouter" || resolved.provider === "aihubmix" ? resolved.provider : "openrouter"]
+  }
+
+  // Hold credits (billable tiers only). deductBalance subtracts from credits balance.
+  const holdCredits = IMAGE_COST_CREDITS_DEFAULT * n
+  let held = 0
+  if (billableTier(user.tier)) {
+    const bal = await getBalance(user.id, env.ARCANA_PROXY)
+    if (bal < holdCredits) {
+      return json({
+        error: "insufficient_credits",
+        message: `Image generation needs ~${holdCredits} credits (have ${Math.round(bal)}). Top up or try a free image model.`,
+        balance: bal,
+        required: holdCredits,
+      }, 402, cors)
+    }
+    await deductBalance(user.id, holdCredits, env.ARCANA_PROXY)
+    held = holdCredits
+  }
+
+  const start = Date.now()
+  let lastStatus = 502
+  let lastBody = "all_providers_failed"
+  let lastProvider = ""
+
+  const stripPrefix = (m: string) => {
+    if (m.startsWith("aihubmix/")) return m.slice("aihubmix/".length)
+    if (m.startsWith("aihub/")) return m.slice("aihub/".length)
+    if (m.startsWith("or/")) return m.slice(3)
+    return m
+  }
+
+  for (const provider of attemptOrder) {
+    if (provider !== "openrouter" && provider !== "aihubmix") continue
+    try {
+      let upstream: Response
+      if (provider === "openrouter") {
+        const orKey = getOpenRouterKey(env)
+        if (!orKey) { lastBody = "no_openrouter_key"; continue }
+        // OpenRouter expects unprefixed org/model for most; keep full slug when not aihubmix-only
+        const orModel = requestedModel.startsWith("aihubmix/") || requestedModel.startsWith("aihub/")
+          ? stripPrefix(requestedModel)
+          : stripPrefix(requestedModel)
+        const payload: any = { model: orModel, prompt, n }
+        if (size) payload.size = size
+        if (quality) payload.quality = quality
+        if (resolution) payload.resolution = resolution
+        if (aspectRatio) payload.aspect_ratio = aspectRatio
+        upstream = await fetch("https://openrouter.ai/api/v1/images", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${orKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://arcana.otnelhq.com",
+            "X-Title": "Arcana",
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(120_000),
+        })
+      } else {
+        const ahKey = getAIHubMixKey(env)
+        if (!ahKey) { lastBody = "no_aihubmix_key"; continue }
+        const payload: any = {
+          model: stripPrefix(requestedModel),
+          prompt,
+          n,
+          response_format: responseFormat,
+        }
+        if (size) payload.size = size
+        if (quality) payload.quality = quality
+        // Aihubmix OpenAI-compat: map aspect_ratio → size when size omitted
+        if (!size && aspectRatio) {
+          const sizeMap: Record<string, string> = {
+            "1:1": "1024x1024",
+            "16:9": "1792x1024",
+            "9:16": "1024x1792",
+          }
+          if (sizeMap[aspectRatio]) payload.size = sizeMap[aspectRatio]
+        }
+        upstream = await fetchAIHubMix("/v1/images/generations", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${ahKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(120_000),
+        })
+      }
+
+      lastStatus = upstream.status
+      lastProvider = provider
+      const text = await upstream.text()
+      let data: any = {}
+      try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text.slice(0, 300) } }
+
+      if (!upstream.ok) {
+        lastBody = typeof data.error === "string"
+          ? data.error
+          : (data.error?.message || data.message || text.slice(0, 200))
+        continue
+      }
+
+      const items: any[] = Array.isArray(data.data) ? data.data : []
+      const normalized = items.map((item: any) => {
+        const out: any = {}
+        if (item.b64_json) {
+          const b64 = String(item.b64_json)
+          if (b64.length <= IMAGE_B64_MAX_CHARS) out.b64_json = b64
+        }
+        if (item.url) out.url = String(item.url)
+        if (item.media_type) out.media_type = item.media_type
+        if (item.revised_prompt) out.revised_prompt = item.revised_prompt
+        return out
+      }).filter((x: any) => x.b64_json || x.url)
+
+      if (!normalized.length) {
+        lastBody = "empty_image_response"
+        continue
+      }
+
+      const usdCost = typeof data.usage?.cost === "number"
+        ? data.usage.cost
+        : (IMAGE_COST_CREDITS_DEFAULT * normalized.length) / 100
+      const actualCredits = Math.max(1, Math.round(usdCost * 100 * 1.4))
+
+      if (billableTier(user.tier) && held > 0) {
+        // Adjust hold to actual: refund excess or charge remainder
+        const delta = actualCredits - held
+        if (delta !== 0) await deductBalance(user.id, delta, env.ARCANA_PROXY)
+        held = 0
+      }
+
+      const durationMs = Date.now() - start
+      ctx.waitUntil(recordSession(
+        user,
+        requestedModel,
+        provider,
+        data.usage?.prompt_tokens ?? 0,
+        data.usage?.completion_tokens ?? 0,
+        actualCredits,
+        durationMs,
+        "completed",
+        1,
+        env.ARCANA_PROXY,
+        { firstMessage: `[image] ${prompt.slice(0, 220)}` },
+      ))
+
+      return json({
+        created: data.created ?? Math.floor(Date.now() / 1000),
+        data: normalized,
+        model: requestedModel,
+        provider,
+        usage: data.usage ?? { cost: usdCost },
+      }, 200, cors)
+    } catch (e) {
+      lastBody = String(e).slice(0, 200)
+      lastStatus = 502
+    }
+  }
+
+  // Refund hold on total failure
+  if (billableTier(user.tier) && held > 0) {
+    try { await deductBalance(user.id, -held, env.ARCANA_PROXY) } catch {}
+  }
+
+  return arcanaErrorResponse(lastStatus, lastBody, {
+    provider: lastProvider || undefined,
+    code: "ARC_IMAGE_FAILED",
+    cors,
+  })
 }
 
 /** Subjects that may hold this user's sessions/memory (JWT sub + linked license ids). */

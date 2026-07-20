@@ -1,0 +1,475 @@
+/**
+ * Top-tier free routing algorithm for Arcana.
+ *
+ * Goals:
+ *  - Quality over quantity: rank free models, prefer signal density.
+ *  - Progressive tokens: expand budget only when free turns are succeeding.
+ *  - Scale-ready: rate limits and weekly free caps designed for ~5k free users.
+ *  - Discover free / free-long / Chinese long-context from live catalog.
+ *
+ * Free users never default to paid Aihubmix. Paid long Chinese models are
+ * classified for Pro / future tiers, not free product path.
+ */
+
+export type ClassifiedModel = {
+  id: string
+  free: boolean
+  contextLength: number
+  longContext: boolean // ≥ 256k
+  megaContext: boolean // ≥ 900k
+  chinese: boolean
+  coding: boolean
+  qualityScore: number
+  promptPrice: number
+  completionPrice: number
+}
+
+export type FreePoolSnapshot = {
+  updatedAt: string
+  free: ClassifiedModel[]
+  freeLong: ClassifiedModel[]
+  paidLongChinese: ClassifiedModel[]
+  defaultModel: string
+}
+
+export type ProgressiveBudget = {
+  maxInputTokens: number
+  maxOutputTokens: number
+  tier: "lean" | "standard" | "expanded"
+  reason: string
+}
+
+// ── Constants (scale for ~5k free users) ──────────────────────────────────
+
+/** Seed pool if catalog discovery fails or is empty */
+export const FREE_MODEL_SEED = [
+  "openrouter/free",
+  "google/gemma-4-31b-it:free",
+  "google/gemma-4-26b-a4b-it:free",
+  "openai/gpt-oss-20b:free",
+  "nvidia/nemotron-nano-9b-v2:free",
+  "nvidia/nemotron-3-nano-30b-a3b:free",
+  "tencent/hy3:free",
+] as const
+
+export const FREE_MODEL_DEFAULT = "openrouter/free"
+
+/** Hard weekly free product caps (unchanged product economics) */
+export const FREE_SESSION_TURN_LIMIT = 10
+export const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
+export const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
+export const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000
+
+/**
+ * Progressive wire budgets — quality first, expand only when healthy.
+ * Even "expanded" stays far below 1M; long models are for SELECT/map, not dump.
+ */
+export const FREE_BUDGET = {
+  lean: { maxInputTokens: 6_144, maxOutputTokens: 1_536 },
+  standard: { maxInputTokens: 10_240, maxOutputTokens: 2_048 },
+  expanded: { maxInputTokens: 14_336, maxOutputTokens: 2_048 },
+} as const
+
+/** Absolute ceiling (never exceed even on expanded) */
+export const FREE_MAX_INPUT_TOKENS = FREE_BUDGET.expanded.maxInputTokens
+export const FREE_MAX_OUTPUT_TOKENS = FREE_BUDGET.expanded.maxOutputTokens
+
+/** Rate limits sized for ~5k free MAU (peak ~50–100 free LLM req/min globally) */
+export const FREE_IP_RATE_LIMIT = 15 // was 20 — tighter under multi-account
+export const FREE_USER_RATE_LIMIT = 8 // was 12 — one user shouldn't hog free pool
+export const FREE_GLOBAL_SOFT_RPM = 120 // isolate-local soft brake for free LLM paths
+
+const CHINESE_RE =
+  /qwen|deepseek|glm|yi-|moonshot|kimi|minimax|baichuan|internlm|stepfun|doubao|hunyuan|ernie|zhipu|01-ai|alibaba|tencent|bytedance|hy3|seedream|yuanbao/i
+const CODING_RE = /code|coder|coding|instruct|chat|it$|oss|nemotron|gemma|llama|qwen|deepseek|glm/i
+const LONG_CTX = 262_144
+const MEGA_CTX = 900_000
+
+const POOL_KV_KEY = "free:model_pools"
+const POOL_TTL_SEC = 3600 // reclassify at least hourly
+
+// ── Classification ────────────────────────────────────────────────────────
+
+function priceNum(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v)) return v
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : 1
+  }
+  return 1 // unknown → treat as paid
+}
+
+function contextLen(m: any): number {
+  const c =
+    m?.context_length
+    ?? m?.contextLength
+    ?? m?.top_provider?.context_length
+    ?? m?.architecture?.context_length
+    ?? 0
+  const n = Number(c)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+export function isFreePricing(m: any, id: string): boolean {
+  if (/:free$/i.test(id) || /^openrouter\/free$/i.test(id)) return true
+  const p = priceNum(m?.pricing?.prompt ?? m?.pricing?.input)
+  const c = priceNum(m?.pricing?.completion ?? m?.pricing?.output)
+  // OpenRouter free variants are 0/0; some list null
+  if (p === 0 && c === 0) return true
+  return false
+}
+
+/**
+ * Quality score 0–100. Higher = prefer for free agent turns.
+ * Quality over raw size: coding/instruct + free + healthy family beat giant empty free shells.
+ */
+export function scoreModel(m: ClassifiedModel): number {
+  let s = 0
+  if (m.free) s += 25
+  // Context: diminishing returns; 128k–256k is sweet for free agent; 1M is bonus
+  if (m.contextLength >= MEGA_CTX) s += 18
+  else if (m.contextLength >= LONG_CTX) s += 14
+  else if (m.contextLength >= 128_000) s += 10
+  else if (m.contextLength >= 32_000) s += 6
+  else s += 2
+
+  if (m.coding) s += 12
+  if (m.chinese && m.free) s += 10 // free Chinese long-context is rare gold
+  if (m.chinese && m.megaContext && !m.free) s += 8 // paid CN long — pro pool
+
+  // Family quality priors (agent/coding usefulness on free)
+  const id = m.id.toLowerCase()
+  if (/qwen|deepseek|glm|gemma|gpt-oss|nemotron|llama|hy3|kimi|minimax/.test(id)) s += 8
+  if (/70b|72b|32b|27b|31b|235b|397b|ultra|super|pro/.test(id)) s += 5
+  if (/nano|tiny|1b|2b|3b|4b|7b|8b|9b|embed|safety|tts|whisper|image|video/.test(id)) s -= 6
+  if (/embed|rerank|moderation|whisper|tts|image|video|lyria/.test(id)) s -= 30
+
+  // Prefer meta free router as resilient default, not highest quality
+  if (id === "openrouter/free") s += 15
+
+  return Math.max(0, Math.min(100, s))
+}
+
+export function classifyModel(raw: any): ClassifiedModel | null {
+  const id = String(raw?.id ?? raw?.name ?? "").trim()
+  if (!id) return null
+  // Skip aihubmix-prefixed duplicates for free pool (route free via OpenRouter)
+  if (id.startsWith("aihubmix/") || id.startsWith("cloudflare/")) return null
+
+  const free = isFreePricing(raw, id)
+  const ctx = contextLen(raw)
+  const chinese = CHINESE_RE.test(id)
+  const coding = CODING_RE.test(id)
+  const model: ClassifiedModel = {
+    id,
+    free,
+    contextLength: ctx,
+    longContext: ctx >= LONG_CTX,
+    megaContext: ctx >= MEGA_CTX,
+    chinese,
+    coding,
+    qualityScore: 0,
+    promptPrice: priceNum(raw?.pricing?.prompt ?? raw?.pricing?.input),
+    completionPrice: priceNum(raw?.pricing?.completion ?? raw?.pricing?.output),
+  }
+  model.qualityScore = scoreModel(model)
+  return model
+}
+
+function isAgentUsable(m: ClassifiedModel): boolean {
+  const id = m.id.toLowerCase()
+  // Free agent pool: chat/coding only — never embeddings, safety, media
+  if (/embed|rerank|moderation|safety|whisper|tts|image|video|lyria|asr|transcri/i.test(id)) return false
+  if (m.qualityScore < 25) return false
+  return true
+}
+
+export function buildPoolsFromCatalog(models: any[]): FreePoolSnapshot {
+  const classified = models
+    .map(classifyModel)
+    .filter((m): m is ClassifiedModel => !!m)
+
+  const free = classified
+    .filter((m) => m.free && isAgentUsable(m))
+    .sort((a, b) => b.qualityScore - a.qualityScore)
+
+  const freeLong = free
+    .filter((m) => m.longContext || m.megaContext)
+    .sort((a, b) => b.qualityScore - a.qualityScore || b.contextLength - a.contextLength)
+
+  const paidLongChinese = classified
+    .filter((m) => !m.free && m.chinese && (m.longContext || m.megaContext))
+    .sort((a, b) => b.qualityScore - a.qualityScore || a.promptPrice - b.promptPrice)
+    .slice(0, 40)
+
+  // Ensure seed models present
+  const freeIds = new Set(free.map((m) => m.id))
+  for (const seed of FREE_MODEL_SEED) {
+    if (!freeIds.has(seed)) {
+      free.push({
+        id: seed,
+        free: true,
+        contextLength: 32_000,
+        longContext: false,
+        megaContext: false,
+        chinese: /tencent|hy3|qwen|deepseek/i.test(seed),
+        coding: true,
+        qualityScore: seed === FREE_MODEL_DEFAULT ? 40 : 30,
+        promptPrice: 0,
+        completionPrice: 0,
+      })
+    }
+  }
+  free.sort((a, b) => b.qualityScore - a.qualityScore)
+
+  return {
+    updatedAt: new Date().toISOString(),
+    free: free.slice(0, 60),
+    freeLong: freeLong.slice(0, 20),
+    paidLongChinese,
+    defaultModel: free[0]?.id || FREE_MODEL_DEFAULT,
+  }
+}
+
+// ── Pool cache ────────────────────────────────────────────────────────────
+
+let poolMem: { at: number; snap: FreePoolSnapshot } | null = null
+const POOL_MEM_TTL_MS = 10 * 60 * 1000
+
+export function invalidateFreePoolCache(): void {
+  poolMem = null
+}
+
+export async function loadFreePools(
+  kv: KVNamespace,
+  fetchCatalog: () => Promise<any[]>,
+  opts?: { force?: boolean },
+): Promise<FreePoolSnapshot> {
+  const now = Date.now()
+  if (!opts?.force && poolMem && now - poolMem.at < POOL_MEM_TTL_MS) return poolMem.snap
+
+  if (!opts?.force) {
+    try {
+      const cached = (await kv.get(POOL_KV_KEY, "json")) as FreePoolSnapshot | null
+      if (cached?.free?.length && cached.updatedAt) {
+        const age = now - new Date(cached.updatedAt).getTime()
+        if (age < POOL_TTL_SEC * 1000) {
+          poolMem = { at: now, snap: cached }
+          return cached
+        }
+      }
+    } catch {}
+  }
+
+  // Refresh from catalog
+  let models: any[] = []
+  try {
+    models = await fetchCatalog()
+  } catch {}
+  const snap = buildPoolsFromCatalog(models)
+  poolMem = { at: now, snap }
+  try {
+    await kv.put(POOL_KV_KEY, JSON.stringify(snap), { expirationTtl: POOL_TTL_SEC * 6 })
+  } catch {}
+  return snap
+}
+
+export function seedPoolSnapshot(): FreePoolSnapshot {
+  const free = FREE_MODEL_SEED.map((id) => {
+    const m: ClassifiedModel = {
+      id,
+      free: true,
+      contextLength: 32_000,
+      longContext: false,
+      megaContext: false,
+      chinese: /tencent|hy3|qwen|deepseek/i.test(id),
+      coding: true,
+      qualityScore: 0,
+      promptPrice: 0,
+      completionPrice: 0,
+    }
+    m.qualityScore = scoreModel(m)
+    return m
+  }).sort((a, b) => b.qualityScore - a.qualityScore)
+  return {
+    updatedAt: new Date().toISOString(),
+    free,
+    freeLong: [],
+    paidLongChinese: [],
+    defaultModel: FREE_MODEL_DEFAULT,
+  }
+}
+
+// ── Routing decisions ─────────────────────────────────────────────────────
+
+export function isFreeModelId(model: string, pool?: FreePoolSnapshot): boolean {
+  const m = model.replace(/^(aihubmix|aihub|or|omni|cf|cloudflare)\//, "").trim()
+  if (!m) return false
+  if (/:free$/i.test(m) || /^openrouter\/free$/i.test(m)) return true
+  if (pool?.free.some((x) => x.id === m || x.id === model)) return true
+  for (const s of FREE_MODEL_SEED) if (s === m || s === model) return true
+  return false
+}
+
+export function ensureFreeModel(
+  requested: string,
+  pool: FreePoolSnapshot,
+  opts?: { preferLong?: boolean },
+): { model: string; remapped: boolean; from: string; qualityScore: number } {
+  const raw = String(requested || "").trim()
+  const stripped = raw.replace(/^(aihubmix|aihub|or|omni|cf|cloudflare)\//, "")
+
+  if (isFreeModelId(raw, pool) || isFreeModelId(stripped, pool)) {
+    const id = isFreeModelId(stripped, pool) ? stripped : raw.replace(/^(aihubmix|aihub|or)\//, "")
+    const hit = pool.free.find((x) => x.id === id)
+    return {
+      model: id,
+      remapped: id !== raw,
+      from: raw,
+      qualityScore: hit?.qualityScore ?? 40,
+    }
+  }
+
+  // Paid or unknown → best free (long if preferred and available)
+  const pick =
+    (opts?.preferLong && pool.freeLong[0])
+    || pool.free[0]
+    || { id: FREE_MODEL_DEFAULT, qualityScore: 40 }
+
+  return {
+    model: pick.id,
+    remapped: true,
+    from: raw || "(none)",
+    qualityScore: pick.qualityScore,
+  }
+}
+
+/** Free→free failover list ranked by quality, optional long-first */
+export function freeModelFailoverList(
+  primary: string,
+  pool: FreePoolSnapshot,
+  max = 4,
+  preferLong = false,
+): string[] {
+  const ranked = preferLong && pool.freeLong.length
+    ? [...pool.freeLong, ...pool.free]
+    : [...pool.free]
+  const out: string[] = []
+  const seen = new Set<string>([primary, primary.replace(/^(or|aihubmix)\//, "")])
+  for (const m of ranked) {
+    if (seen.has(m.id)) continue
+    seen.add(m.id)
+    out.push(m.id)
+    if (out.length >= max) break
+  }
+  return out
+}
+
+/**
+ * Progressive token budget: lean → standard → expanded.
+ * Expand only when free turns are succeeding and session is mid-flight.
+ * Quality first: never expand on failures or first turn (establish signal).
+ */
+export function progressiveBudget(input: {
+  turnsUsed: number
+  turnsLimit: number
+  tokensUsed: number
+  tokensLimit: number
+  lastTurnFailed?: boolean
+  preferLong?: boolean
+}): ProgressiveBudget {
+  const remainingTurns = Math.max(0, input.turnsLimit - input.turnsUsed)
+  const tokenPressure = input.tokensLimit > 0 ? input.tokensUsed / input.tokensLimit : 0
+
+  // Always lean if failing, almost out of weekly tokens, or first turn
+  if (input.lastTurnFailed || input.turnsUsed <= 1 || tokenPressure > 0.75) {
+    return {
+      ...FREE_BUDGET.lean,
+      tier: "lean",
+      reason: input.lastTurnFailed
+        ? "last_turn_failed"
+        : input.turnsUsed <= 1
+          ? "first_turns_lean"
+          : "token_pressure",
+    }
+  }
+
+  // Expanded: healthy mid-session, budget left, quality path open
+  if (
+    input.turnsUsed >= 4
+    && remainingTurns >= 2
+    && tokenPressure < 0.45
+    && !input.preferLong // long tasks stay standard; packer selects, model may be long
+  ) {
+    return {
+      ...FREE_BUDGET.expanded,
+      tier: "expanded",
+      reason: "healthy_mid_session",
+    }
+  }
+
+  // Standard default after turn 2
+  if (input.turnsUsed >= 2 && tokenPressure < 0.65) {
+    return {
+      ...FREE_BUDGET.standard,
+      tier: "standard",
+      reason: "steady_progress",
+    }
+  }
+
+  return {
+    ...FREE_BUDGET.lean,
+    tier: "lean",
+    reason: "default_lean",
+  }
+}
+
+export function clampBodyToBudget(body: any, budget: ProgressiveBudget): any {
+  const next = { ...body }
+  if (Number(next.max_tokens) > budget.maxOutputTokens || next.max_tokens === undefined) {
+    next.max_tokens = budget.maxOutputTokens
+  }
+  if (Number(next.max_completion_tokens) > budget.maxOutputTokens) {
+    next.max_completion_tokens = budget.maxOutputTokens
+  }
+  if (next.max_completion_tokens === undefined && next.max_tokens === undefined) {
+    next.max_tokens = budget.maxOutputTokens
+  }
+  return next
+}
+
+/** Heuristic: request looks like it needs long context (still pack, but prefer free-long models) */
+export function wantsLongContext(body: any, headerFlag?: string | null): boolean {
+  if (headerFlag === "1" || headerFlag === "true" || headerFlag === "long") return true
+  const msgs = Array.isArray(body?.messages) ? body.messages : []
+  let chars = 0
+  for (const m of msgs) {
+    const c = m?.content
+    if (typeof c === "string") chars += c.length
+    else if (Array.isArray(c)) {
+      for (const p of c) {
+        if (typeof p?.text === "string") chars += p.text.length
+      }
+    }
+  }
+  // ~12k+ chars ≈ multi-file / long paste → prefer free-long if any
+  return chars >= 12_000
+}
+
+// ── Global free soft rate (per isolate — best-effort for 5k scale) ─────────
+
+const freeGlobalHits: number[] = []
+
+export function freeGlobalAllow(rpm = FREE_GLOBAL_SOFT_RPM): boolean {
+  const now = Date.now()
+  while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
+  if (freeGlobalHits.length >= rpm) return false
+  freeGlobalHits.push(now)
+  return true
+}
+
+export function freeGlobalLoad(): number {
+  const now = Date.now()
+  while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
+  return freeGlobalHits.length
+}
