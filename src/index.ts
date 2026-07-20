@@ -1,8 +1,22 @@
 import type { AnalyticsEvent } from "./types"
-import { OmniRouteContainer } from "./container"
-export { OmniRouteContainer }
+// The OmniRouteContainer class is defined in src/container.ts and re-exported
+// here because the wrangler config references it by name. The class is
+// INSTANTIATED only inside the warm Worker (which owns the container app);
+// the proxy Worker only references the type for env typing.
+export { OmniRouteContainer } from "./container"
+import type { OmniRouteContainer } from "./container"
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
+const AIHUBMIX_URL = "https://aihubmix.com"
+const AIHUBMIX_FALLBACK_URL = "https://api.inferera.com"
+const AIHUBMIX_URLS = [AIHUBMIX_URL, AIHUBMIX_FALLBACK_URL]
+const CLOUDFLARE_URL_FALLBACK = "https://api.cloudflare.com/client/v4/accounts/_cf_account_missing_/ai/v1"
+
+function cloudflareBaseURL(env: Env): string {
+  const account = env.CLOUDFLARE_ACCOUNT_ID?.trim()
+  if (!account) return CLOUDFLARE_URL_FALLBACK
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account)}/ai/v1`
+}
 const PAYPAL_LIVE = "https://api-m.paypal.com"
 const PAYPAL_SANDBOX = "https://api-m.sandbox.paypal.com"
 
@@ -11,8 +25,14 @@ interface Env {
   OPENROUTER_KEYS?: string       // comma-separated pool of API keys for rotation
   OMNIRoute_KEY?: string
   OMNIRoute_KEYS?: string        // comma-separated pool of API keys for rotation
+  AIHUBMIX_KEY?: string
+  AIHUBMIX_KEYS?: string         // comma-separated pool of API keys for rotation
+  CLOUDFLARE_KEY?: string
+  CLOUDFLARE_KEYS?: string      // comma-separated pool of Cloudflare API tokens (Workers AI: Read)
+  CLOUDFLARE_ACCOUNT_ID?: string  // Cloudflare account ID; required for Workers AI
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
+  PAYPAL_SANDBOX?: string
   ARCANA_PROXY: KVNamespace
   ARCANA_LICENSE: KVNamespace
   ARCANA_PROXY_ANALYTICS?: AnalyticsEngineDataset
@@ -22,15 +42,20 @@ interface Env {
   PAYPAL_WEBHOOK_ID?: string
   ARCANA_ADMIN_KEY?: string
   ARCANA_ADMIN_KEYS?: string
-  // OmniRoute container is a Durable Object namespace (the class lives in the
-  // warm Worker; this Worker just gets the binding). Optional so the type-check
-  // passes when the binding is absent (e.g. local dev before the image is
-  // pushed). The proxy forces the priority list to ["openrouter"] when unset.
-  OMNIRoute?: DurableObjectNamespace<OmniRouteContainer>
+  // The OmniRoute container app is owned by the warm Worker
+  // (`arcana-omniroute-warm`). The proxy reaches it through a service
+  // binding; the warm Worker exposes a single `omFetch` RPC that proxies
+  // to the container. Optional so the type-check passes when the binding
+  // is absent; the priority list is forced to ["openrouter"] when unset.
+  OMNIRoute_WARM?: { omFetch: (req: Request) => Promise<Response> }
   OMNIRoute_WARM_QUEUE?: Queue
 }
 
-type Provider = "openrouter" | "omniroute"
+type Provider = "openrouter" | "omniroute" | "aihubmix" | "cloudflare"
+
+function isProvider(value: unknown): value is Provider {
+  return value === "openrouter" || value === "omniroute" || value === "aihubmix" || value === "cloudflare"
+}
 
 // --- OpenRouter API key pool (rotation + rate-limit cooldown) ---
 interface KeyState {
@@ -136,6 +161,118 @@ function markOmniKeySuccess(key: string): void {
 }
 // --- end OmniRoute key pool ---
 
+// --- AIHubMix key pool (OpenAI-compatible, default base with Inferera fallback) ---
+let aiHubMixKeyPool: KeyState[] = []
+let aiHubMixKeyPoolIndex = 0
+
+function initAIHubMixKeyPool(env: Env): KeyState[] {
+  if (aiHubMixKeyPool.length > 0) return aiHubMixKeyPool
+  const raw = env.AIHUBMIX_KEYS || env.AIHUBMIX_KEY || ""
+  const keys = raw.split(",").map(k => k.trim()).filter(Boolean)
+  if (keys.length === 0) return []
+  aiHubMixKeyPool = keys.map(k => ({ key: k, cooldownUntil: 0, failures: 0 }))
+  return aiHubMixKeyPool
+}
+
+function getAIHubMixKey(env: Env): string | null {
+  const pool = initAIHubMixKeyPool(env)
+  if (pool.length === 0) return null
+  const now = Date.now()
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (aiHubMixKeyPoolIndex + i) % pool.length
+    const ks = pool[idx]
+    if (now >= ks.cooldownUntil) {
+      aiHubMixKeyPoolIndex = (idx + 1) % pool.length
+      return ks.key
+    }
+  }
+  const best = pool.reduce((a, b) => a.cooldownUntil < b.cooldownUntil ? a : b)
+  return best.key
+}
+
+function markAIHubMixKeyRateLimited(key: string): void {
+  const ks = aiHubMixKeyPool.find(k => k.key === key)
+  if (!ks) return
+  const now = Date.now()
+  ks.failures++
+  const backoff = KEY_COOLDOWN_MS * Math.pow(2, Math.min(ks.failures - 1, 3))
+  ks.cooldownUntil = now + backoff
+  if (ks.failures >= KEY_MAX_FAILURES) {
+    ks.cooldownUntil = now + 5 * 60 * 1000
+  }
+}
+
+function markAIHubMixKeySuccess(key: string): void {
+  const ks = aiHubMixKeyPool.find(k => k.key === key)
+  if (ks) ks.failures = 0
+}
+
+// --- Cloudflare Workers AI key pool (token rotation, matches AIHubMix shape) ---
+let cloudflareKeyPool: KeyState[] = []
+let cloudflareKeyPoolIndex = 0
+
+function initCloudflareKeyPool(env: Env): KeyState[] {
+  if (cloudflareKeyPool.length > 0) return cloudflareKeyPool
+  const raw = env.CLOUDFLARE_KEYS || env.CLOUDFLARE_KEY || ""
+  const keys = raw.split(",").map(k => k.trim()).filter(Boolean)
+  if (keys.length === 0) return []
+  cloudflareKeyPool = keys.map(k => ({ key: k, cooldownUntil: 0, failures: 0 }))
+  return cloudflareKeyPool
+}
+
+function getCloudflareKey(env: Env): string | null {
+  const pool = initCloudflareKeyPool(env)
+  if (pool.length === 0) return null
+  const now = Date.now()
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (cloudflareKeyPoolIndex + i) % pool.length
+    const ks = pool[idx]
+    if (now >= ks.cooldownUntil) {
+      cloudflareKeyPoolIndex = (idx + 1) % pool.length
+      return ks.key
+    }
+  }
+  const best = pool.reduce((a, b) => a.cooldownUntil < b.cooldownUntil ? a : b)
+  return best.key
+}
+
+function markCloudflareKeyRateLimited(key: string): void {
+  const ks = cloudflareKeyPool.find(k => k.key === key)
+  if (!ks) return
+  const now = Date.now()
+  ks.failures++
+  const backoff = KEY_COOLDOWN_MS * Math.pow(2, Math.min(ks.failures - 1, 3))
+  ks.cooldownUntil = now + backoff
+  if (ks.failures >= KEY_MAX_FAILURES) {
+    ks.cooldownUntil = now + 5 * 60 * 1000
+  }
+}
+
+function markCloudflareKeySuccess(key: string): void {
+  const ks = cloudflareKeyPool.find(k => k.key === key)
+  if (ks) ks.failures = 0
+}
+// --- end Cloudflare key pool ---
+
+async function fetchAIHubMix(path: string, init: RequestInit): Promise<Response> {
+  let lastError: unknown
+  for (let i = 0; i < AIHUBMIX_URLS.length; i++) {
+    const baseURL = AIHUBMIX_URLS[i]!
+    try {
+      const response = await fetch(`${baseURL}${path}`, init)
+      if (i === 0 && response.status >= 500) {
+        await response.arrayBuffer().catch(() => undefined)
+        continue
+      }
+      return response
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError ?? new Error("AIHubMix upstream unavailable")
+}
+// --- end AIHubMix key pool ---
+
 // --- Provider priority list (KV-backed, env fallback) ---
 // If the container binding is absent, force the priority list to ["openrouter"]
 // so the new code is a no-op until the OmniRoute image is actually pushed.
@@ -144,8 +281,6 @@ let providerPriorityCacheTime = 0
 const PROVIDER_PRIORITY_TTL = 60_000  // re-read KV at most once per minute per isolate
 
 async function getProviderPriority(env: Env, ctx: ExecutionContext): Promise<Provider[]> {
-  // Belt + suspenders: if the container binding isn't configured, hard-pin to OpenRouter.
-  if (!env.OMNIRoute) return ["openrouter"]
   const now = Date.now()
   if (providerPriorityCache && now - providerPriorityCacheTime < PROVIDER_PRIORITY_TTL) {
     return providerPriorityCache
@@ -154,8 +289,8 @@ async function getProviderPriority(env: Env, ctx: ExecutionContext): Promise<Pro
   try {
     const raw = await env.ARCANA_PROXY.get("provider:priority", "json") as Provider[] | null
     if (Array.isArray(raw) && raw.length > 0) {
-      // Whitelist: only allow the two known providers, drop everything else.
-      const filtered = raw.filter((p): p is Provider => p === "openrouter" || p === "omniroute")
+      // Whitelist: only allow known providers, drop everything else.
+      const filtered = raw.filter(isProvider).filter((p) => p !== "omniroute" || Boolean(env.OMNIRoute_WARM))
       if (filtered.length > 0) list = filtered
     }
   } catch {}
@@ -166,7 +301,11 @@ async function getProviderPriority(env: Env, ctx: ExecutionContext): Promise<Pro
 
 function resolveProvider(model: string, priority: Provider[]): { provider: Provider; model: string } | null {
   if (model.startsWith("omni/")) return { provider: "omniroute", model: model.slice(5) }
-  if (model.startsWith("or/"))   return { provider: "openrouter", model: model.slice(3) }
+  if (model.startsWith("or/")) return { provider: "openrouter", model: model.slice(3) }
+  if (model.startsWith("aihubmix/")) return { provider: "aihubmix", model: model.slice("aihubmix/".length) }
+  if (model.startsWith("aihub/")) return { provider: "aihubmix", model: model.slice("aihub/".length) }
+  if (model.startsWith("cf/")) return { provider: "cloudflare", model: model.slice(3) }
+  if (model.startsWith("cloudflare/")) return { provider: "cloudflare", model: model.slice("cloudflare/".length) }
   for (const p of priority) return { provider: p, model }
   return null
 }
@@ -205,8 +344,12 @@ interface SendEmail {
 // Per-IP + per-user rate limiting
 const ipLimits = new Map<string, { count: number; resetAt: number }>()
 const userLimits = new Map<string, { count: number; resetAt: number }>()
+const freeIpLimits = new Map<string, { count: number; resetAt: number }>()
+const freeUserLimits = new Map<string, { count: number; resetAt: number }>()
 const IP_RATE_LIMIT = 50
 const USER_RATE_LIMIT = 25
+const FREE_IP_RATE_LIMIT = 20
+const FREE_USER_RATE_LIMIT = 8
 const RATE_WINDOW = 60000
 
 // Daily usage limits by tier
@@ -231,6 +374,257 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
   const midnight = new Date(date + "T23:59:59Z").getTime()
   kv.put(key, String(current + 1), { expirationTtl: Math.ceil((midnight - now) / 1000) })
   return { allowed: true, remaining }
+}
+
+const FREE_SESSION_TURN_LIMIT = 10
+const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
+const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
+const FREE_TURN_PROVIDER_CALL_LIMIT = 1     // 1 provider dispatch per turn-id (idempotent retries reuse the existing reservation)
+const FREE_MAX_INPUT_TOKENS = 16_384           // ~16K raw input per turn (down from 32K)
+const FREE_MAX_OUTPUT_TOKENS = 2_048           // ~2K output per turn (down from 4K); biggest single cost lever
+const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // unchanged
+const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000    // per-subject-key combined in+out cap; reset anchored to activated_at + 7d
+
+type FreeUsageState = "eligible" | "active" | "exhausted" | "expired"
+type FreeTurnStatus = "admitted" | "completed" | "failed"
+
+interface FreeTurnReservation {
+  admittedAt: number
+  providerCalls: number
+  status: FreeTurnStatus
+  settledAt?: number
+}
+
+interface FreeUsageRecord {
+  freeSessionId: string
+  arcanaSessionKey: string
+  activatedAt: number
+  expiresAt: number
+  resetAt: number
+  turnsUsed: number
+  tokensUsed: number                 // combined in+out tokens settled across this weekly record; reset anchored to resetAt
+  reservations: Record<string, FreeTurnReservation>
+}
+
+interface FreeUsageSnapshot {
+  state: FreeUsageState
+  freeSessionId?: string
+  activatedAt?: string
+  expiresAt?: string
+  resetAt?: string
+  used: number
+  remaining: number
+  limit: number
+  tokensUsed: number
+  tokensLimit: number
+  tokensRemaining: number
+}
+
+interface FreeTurnAdmission {
+  allowed: boolean
+  error?: string
+  message?: string
+  recordKey?: string
+  turnKey?: string
+  snapshot: FreeUsageSnapshot
+}
+
+function billableTier(tier: string): boolean {
+  return tier !== "enterprise" && tier !== "free"
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input)
+  const hash = await crypto.subtle.digest("SHA-256", data)
+  return Array.from(new Uint8Array(hash)).map((byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+function freeUsageTtl(record: FreeUsageRecord, now = Date.now()): number {
+  return Math.max(60, Math.ceil((record.resetAt - now) / 1000) + 3600)
+}
+
+function freeUsageSnapshot(record: FreeUsageRecord | null, now = Date.now()): FreeUsageSnapshot {
+  if (!record || now >= record.resetAt) return { state: "eligible", used: 0, remaining: FREE_SESSION_TURN_LIMIT, limit: FREE_SESSION_TURN_LIMIT, tokensUsed: 0, tokensLimit: FREE_WEEKLY_TOKEN_AGGREGATE, tokensRemaining: FREE_WEEKLY_TOKEN_AGGREGATE }
+  const state: FreeUsageState = record.turnsUsed >= FREE_SESSION_TURN_LIMIT
+    ? "exhausted"
+    : record.tokensUsed >= FREE_WEEKLY_TOKEN_AGGREGATE
+      ? "exhausted"
+      : now >= record.expiresAt
+        ? "expired"
+        : "active"
+  return {
+    state,
+    freeSessionId: record.freeSessionId,
+    activatedAt: new Date(record.activatedAt).toISOString(),
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    resetAt: new Date(record.resetAt).toISOString(),
+    used: record.turnsUsed,
+    remaining: Math.max(0, FREE_SESSION_TURN_LIMIT - record.turnsUsed),
+    limit: FREE_SESSION_TURN_LIMIT,
+    tokensUsed: record.tokensUsed,
+    tokensLimit: FREE_WEEKLY_TOKEN_AGGREGATE,
+    tokensRemaining: Math.max(0, FREE_WEEKLY_TOKEN_AGGREGATE - record.tokensUsed),
+  }
+}
+
+function freeUsageHeaders(snapshot?: FreeUsageSnapshot): Record<string, string> {
+  if (!snapshot) return {}
+  const headers: Record<string, string> = {
+    "X-Arcana-Free-State": snapshot.state,
+    "X-Arcana-Free-Used": String(snapshot.used),
+    "X-Arcana-Free-Remaining": String(snapshot.remaining),
+    "X-Arcana-Free-Limit": String(snapshot.limit),
+    "X-Arcana-Free-Tokens-Used": String(snapshot.tokensUsed),
+    "X-Arcana-Free-Tokens-Remaining": String(snapshot.tokensRemaining),
+    "X-Arcana-Free-Tokens-Limit": String(snapshot.tokensLimit),
+  }
+  if (snapshot.expiresAt) headers["X-Arcana-Free-Expires-At"] = snapshot.expiresAt
+  if (snapshot.resetAt) headers["X-Arcana-Free-Reset-At"] = snapshot.resetAt
+  return headers
+}
+
+function freeTurnId(request: Request, body: any): string {
+  return request.headers.get("x-arcana-turn-id")
+    ?? request.headers.get("x-arcana-turn")
+    ?? request.headers.get("x-arcana-request")
+    ?? body?.metadata?.turn_id
+    ?? body?.turn_id
+    ?? crypto.randomUUID()
+}
+
+function freeConversationId(request: Request, body: any): string {
+  return request.headers.get("x-arcana-session-id")
+    ?? request.headers.get("x-arcana-session")
+    ?? body?.metadata?.arcana_session_id
+    ?? body?.metadata?.session_id
+    ?? body?.session_id
+    ?? "default"
+}
+
+
+function clampFreeRequestBody(body: any): any {
+  const next = { ...body }
+  if (Number(next.max_tokens) > FREE_MAX_OUTPUT_TOKENS) next.max_tokens = FREE_MAX_OUTPUT_TOKENS
+  if (Number(next.max_completion_tokens) > FREE_MAX_OUTPUT_TOKENS) next.max_completion_tokens = FREE_MAX_OUTPUT_TOKENS
+  if (next.max_tokens === undefined && next.max_completion_tokens === undefined) next.max_tokens = FREE_MAX_OUTPUT_TOKENS
+  return next
+}
+
+async function readFreeUsageRecord(userId: string, kv: KVNamespace): Promise<{ key: string; record: FreeUsageRecord | null }> {
+  const subject = (await sha256Hex(`free:${userId}`)).slice(0, 40)
+  const key = `free_usage:${subject}`
+  const raw = await kv.get(key, "json") as any
+  if (!raw || typeof raw !== "object") return { key, record: null }
+  return { key, record: { ...raw, reservations: raw.reservations ?? {} } as FreeUsageRecord }
+}
+
+async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace): Promise<FreeTurnAdmission> {
+  const now = Date.now()
+  const { key, record: stored } = await readFreeUsageRecord(user.id, kv)
+  const sessionKey = (await sha256Hex(`session:${freeConversationId(request, body)}`)).slice(0, 40)
+  const turnKey = (await sha256Hex(`turn:${freeTurnId(request, body)}`)).slice(0, 40)
+  let record = stored && now < stored.resetAt ? stored : null
+  if (!record) {
+    record = {
+      freeSessionId: `free_${crypto.randomUUID()}`,
+      arcanaSessionKey: sessionKey,
+      activatedAt: now,
+      expiresAt: now + FREE_SESSION_DURATION_MS,
+      resetAt: now + FREE_SESSION_RESET_MS,
+      turnsUsed: 0,
+      tokensUsed: 0,
+      reservations: {},
+    }
+  }
+
+  if (record.arcanaSessionKey !== sessionKey) {
+    return {
+      allowed: false,
+      error: "free_session_conversation_mismatch",
+      message: "This free session is already bound to another Arcana conversation.",
+      snapshot: freeUsageSnapshot(record, now),
+    }
+  }
+
+  const existing = record.reservations[turnKey]
+  if (existing) {
+    if (existing.providerCalls >= FREE_TURN_PROVIDER_CALL_LIMIT) {
+      return {
+        allowed: false,
+        error: "free_turn_budget_reached",
+        message: "This free turn reached its internal provider-call limit.",
+        snapshot: freeUsageSnapshot(record, now),
+      }
+    }
+    existing.providerCalls++
+    await kv.put(key, JSON.stringify(record), { expirationTtl: freeUsageTtl(record, now) })
+    return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now) }
+  }
+
+  // Weekly aggregate: reject up front if admitting this turn would obviously push tokens over the cap.
+  // (provider-call token accounting happens at settle, so this is a cheap guard against the worst case.)
+  if (record.tokensUsed + inputTokens > FREE_WEEKLY_TOKEN_AGGREGATE) {
+    return {
+      allowed: false,
+      error: "free_weekly_token_limit_reached",
+      message: `This free week's token allowance is used up. Weekly limit: ${FREE_WEEKLY_TOKEN_AGGREGATE.toLocaleString("en")} combined in+out tokens. Resets at ${new Date(record.resetAt).toISOString()}.`,
+      snapshot: freeUsageSnapshot(record, now),
+    }
+  }
+  if (inputTokens > FREE_MAX_INPUT_TOKENS) {
+    return {
+      allowed: false,
+      error: "free_turn_budget_reached",
+      message: `Free turns are limited to about ${FREE_MAX_INPUT_TOKENS.toLocaleString("en")} input tokens. Output is capped at ${FREE_MAX_OUTPUT_TOKENS.toLocaleString("en")} tokens.`,
+      snapshot: freeUsageSnapshot(record, now),
+    }
+  }
+  if (now >= record.expiresAt) {
+    return {
+      allowed: false,
+      error: "free_session_expired",
+      message: "The one-hour free session has ended.",
+      snapshot: freeUsageSnapshot(record, now),
+    }
+  }
+  if (record.turnsUsed >= FREE_SESSION_TURN_LIMIT) {
+    return {
+      allowed: false,
+      error: "free_turn_limit_reached",
+      message: "The free session has used all 10 turns.",
+      snapshot: freeUsageSnapshot(record, now),
+    }
+  }
+
+  record.turnsUsed++
+  record.reservations[turnKey] = { admittedAt: now, providerCalls: 1, status: "admitted" }
+  await kv.put(key, JSON.stringify(record), { expirationTtl: freeUsageTtl(record, now) })
+  return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now) }
+}
+
+async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: "completed" | "failed", kv: KVNamespace, tokensIn: number = 0, tokensOut: number = 0): Promise<void> {
+  if (!admission?.allowed || !admission.recordKey || !admission.turnKey) return
+  const record = await kv.get(admission.recordKey, "json") as FreeUsageRecord | null
+  const turn = record?.reservations?.[admission.turnKey]
+  if (!record || !turn) return
+  turn.status = status
+  turn.settledAt = Date.now()
+  // Aggregate token accounting. Only count completed turns toward the weekly cap;
+  // failed turns consumed a provider dispatch but the user received no useful output,
+  // and we don't want a flaky upstream to silently drain the free allowance.
+  if (status === "completed") {
+    const delta = Math.max(0, tokensIn) + Math.max(0, tokensOut)
+    // Hard clamp to the weekly cap — last-write-wins, KV is eventually consistent.
+    record.tokensUsed = Math.min(FREE_WEEKLY_TOKEN_AGGREGATE, record.tokensUsed + delta)
+  }
+  await kv.put(admission.recordKey, JSON.stringify(record), { expirationTtl: freeUsageTtl(record) })
+}
+
+async function getFreeUsageCurrent(user: { id: string; tier: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (user.tier !== "free") return json({ state: "licensed", limit: null, used: 0, remaining: null }, 200, cors)
+  const { record } = await readFreeUsageRecord(user.id, env.ARCANA_PROXY)
+  const snapshot = freeUsageSnapshot(record)
+  return json(snapshot, 200, { ...cors, ...freeUsageHeaders(snapshot) })
 }
 
 // License cache
@@ -273,7 +667,7 @@ async function verifySupabaseJWT(token: string): Promise<{ sub: string; email: s
     jwksCacheTime = now
     ecdsaKeyCache = null
   }
-  const jwk = jwksCache.keys.find((k: any) => k.kid === header.kid && k.alg === "ES256")
+  const jwk = (jwksCache?.keys ?? []).find((k: any) => k.kid === header.kid && k.alg === "ES256")
   if (!jwk) return null
   try {
     if (!ecdsaKeyCache || ecdsaKeyCache.kid !== header.kid) {
@@ -469,10 +863,10 @@ export default {
     const allowedOrigin = origin === "https://arcana.otnelhq.com" || /^https?:\/\/localhost(:\d+)?$/.test(origin)
       ? origin
       : "https://arcana.otnelhq.com"
-    const corsHeaders = {
+    const corsHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Arcana-Request, X-Arcana-Turn, X-Arcana-Turn-Id, X-Arcana-Session, X-Arcana-Session-Id",
     }
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders })
 
@@ -488,6 +882,8 @@ export default {
       const now = Date.now()
       for (const [key, val] of ipLimits.entries()) { if (now > val.resetAt) ipLimits.delete(key) }
       for (const [key, val] of userLimits.entries()) { if (now > val.resetAt) userLimits.delete(key) }
+      for (const [key, val] of freeIpLimits.entries()) { if (now > val.resetAt) freeIpLimits.delete(key) }
+      for (const [key, val] of freeUserLimits.entries()) { if (now > val.resetAt) freeUserLimits.delete(key) }
     }
 
     // IP-based rate limiting (all endpoints)
@@ -499,7 +895,7 @@ export default {
       if (url.pathname === "/v1/identity/validate-email") return handleValidateEmail(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/create-order") return handleCreateOrder(request, env, ctx, corsHeaders)
       if (url.pathname === "/v1/pay/capture-order") return handleCaptureOrder(request, env, ctx, corsHeaders)
-      if (url.pathname === "/v1/pay/capture-return") return handleCaptureReturn(request, env, corsHeaders)
+      if (url.pathname === "/v1/pay/capture-return") return handleCaptureReturn(request, env, ctx, corsHeaders)
       if (url.pathname === "/v1/pay/webhook") return handlePayPalWebhook(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/setup-plans") return handleSetupPlans(request, env, corsHeaders)
       if (url.pathname === "/v1/pay/create-sub") return handleCreateSub(request, env, corsHeaders)
@@ -513,6 +909,12 @@ export default {
       // User rate limiting (per-minute)
       const userRl = checkRateLimit(user.id, userLimits, USER_RATE_LIMIT)
       if (!userRl.allowed) return json({ error: "rate_limited", message: "25 req/min per user" }, 429, corsHeaders)
+      if (user.tier === "free") {
+        const freeIpRl = checkRateLimit(`free:${clientIp}`, freeIpLimits, FREE_IP_RATE_LIMIT)
+        if (!freeIpRl.allowed) return json({ error: "rate_limited", message: "Free IP burst limit exceeded: 20 req/min" }, 429, corsHeaders)
+        const freeUserRl = checkRateLimit(`free:${user.id}`, freeUserLimits, FREE_USER_RATE_LIMIT)
+        if (!freeUserRl.allowed) return json({ error: "rate_limited", message: "Free user burst limit exceeded: 8 req/min" }, 429, corsHeaders)
+      }
 
       // Daily usage limit (per-tier)
       if (user.tier !== "enterprise") {
@@ -532,6 +934,12 @@ export default {
         }
       }
 
+      // Match /v1/sessions/:uuid before the switch
+      const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/)
+      if (sessionMatch && request.method === "GET") {
+        return handleGetSessionDetail(sessionMatch[1], user, env, corsHeaders)
+      }
+
       switch (url.pathname) {
         case "/v1/chat/completions":
         case "/v1/embeddings":
@@ -540,6 +948,9 @@ export default {
           return listModels(env, corsHeaders)
         case "/v1/usage":
           return getUserUsage(user, env, corsHeaders)
+        case "/v1/free-usage/sessions/current":
+          if (request.method === "GET") return getFreeUsageCurrent(user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/balance":
           return handleGetBalance(user, env, corsHeaders)
         case "/v1/send-receipt":
@@ -549,6 +960,16 @@ export default {
         case "/v1/admin/providers":
           if (request.method === "GET") return handleAdminGetProviders(env, corsHeaders)
           if (request.method === "PUT") return handleAdminSetProviders(request, env, ctx, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/sessions":
+          if (request.method === "GET") return handleGetSessions(request, user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/purchases":
+          if (request.method === "GET") return handleGetPurchases(user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/profile":
+          if (request.method === "GET") return handleGetProfile(user, env, corsHeaders)
+          if (request.method === "PUT") return handlePutProfile(request, user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/health":
           return json({ status: "ok", service: "arcana-proxy", user: user.id, tier: user.tier }, 200, corsHeaders)
@@ -562,8 +983,8 @@ export default {
   },
 }
 
-async function proxyOpenRouter(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string): Promise<Response> {
-  const body = await request.json() as any
+async function proxyOpenRouter(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
+  let body = await request.json() as any
   if (!body.model) return json({ error: "model_required" }, 400, cors)
 
   // Estimate max cost from actual request size and pre-deduct
@@ -586,8 +1007,17 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
     } catch {}
   }
 
+  let freeAdmission: FreeTurnAdmission | undefined
+  const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) })
   try {
-    if (user.tier !== "enterprise") {
+    if (user.tier === "free") {
+      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
+      if (!freeAdmission.allowed) {
+        await releaseLock()
+        return json({ error: freeAdmission.error, message: freeAdmission.message, freeUsage: freeAdmission.snapshot }, 429, responseHeaders())
+      }
+      body = clampFreeRequestBody(body)
+    } else if (billableTier(user.tier)) {
       const balance = await getBalance(user.id, env.ARCANA_PROXY)
       if (balance < maxCost) { await releaseLock(); return json({ error: "insufficient_balance", message: "Add credits via arcana proxy buy", balance, required: Math.round(maxCost) }, 402, cors) }
       await deductBalance(user.id, maxCost, env.ARCANA_PROXY)
@@ -595,7 +1025,11 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   } catch { await releaseLock(); throw new Error("lock error") }
 
   const openRouterKey = getOpenRouterKey(env)
-  if (!openRouterKey) { await releaseLock(); return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors) }
+  if (!openRouterKey) {
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+    await releaseLock()
+    return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, responseHeaders())
+  }
   const headers = new Headers({
     "Content-Type": "application/json",
     Authorization: `Bearer ${openRouterKey}`,
@@ -610,16 +1044,17 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
 
   if (!response.ok) {
     if (response.status === 429 || response.status === 401) markKeyRateLimited(openRouterKey)
-    if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+    if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
     await releaseLock()
     const errorBody = await response.text()
-    return json({ error: "upstream_error", message: errorBody.slice(0, 100) }, response.status, cors)
+    return json({ error: "upstream_error", message: errorBody.slice(0, 100) }, response.status, responseHeaders())
   }
   markKeySuccess(openRouterKey)
 
   const adjustBalance = async (tokensIn: number, tokensOut: number, openRouterCost?: number) => {
     const actualCost = openRouterCost ?? estimateCost(body.model, tokensIn, tokensOut)
-    if (user.tier !== "enterprise") {
+    if (billableTier(user.tier)) {
       const refund = maxCost - actualCost
       if (refund > 0) await deductBalance(user.id, -refund, env.ARCANA_PROXY)
     }
@@ -644,23 +1079,33 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
       } catch { streamFailed = true } finally {
         await writer.close()
         const usage = extractUsage(fullResponse, body.model)
-        if (usage) adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
-        else if (streamFailed && user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+        if (usage) {
+          adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
+          const sc = (usage.totalCost ?? estimateCost(body.model, usage.inputTokens, usage.outputTokens)) * margin * 100
+          ctx.waitUntil(recordSession(user, body.model, "openrouter", usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
+        }
+        else if (streamFailed && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+        if (streamFailed) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
         await releaseLock()
       }
     })()
-    return new Response(readable, { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...cors } })
+    return new Response(readable, { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...responseHeaders() } })
   }
 
   const data = await response.json() as any
+  let tokensIn = 0, tokensOut = 0
   if (data.usage) {
-    const tokensIn = data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0
-    const tokensOut = data.usage.completion_tokens ?? data.usage.output_tokens ?? 0
+    tokensIn = data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0
+    tokensOut = data.usage.completion_tokens ?? data.usage.output_tokens ?? 0
     const openRouterCost = data.usage.total_cost // OpenRouter's actual cost in USD
     await adjustBalance(tokensIn, tokensOut, openRouterCost)
+    const sc = (openRouterCost ?? estimateCost(body.model, tokensIn, tokensOut)) * margin * 100
+    ctx.waitUntil(recordSession(user, body.model, "openrouter", tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
   }
+  ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut))
   await releaseLock()
-  return json(data, response.status, cors)
+  return json(data, response.status, responseHeaders())
 }
 
 function extractUsage(responseText: string, model: string): { inputTokens: number; outputTokens: number; totalCost?: number } | null {
@@ -680,7 +1125,7 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
 // names walk the priority list; omni/<model> / or/<model> force a specific
 // provider. proxyOpenRouter is unchanged.
 async function proxyWithFailover(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
-  const body = await request.json() as any
+  let body = await request.json() as any
   if (!body.model) return json({ error: "model_required" }, 400, cors)
   const requestedModel = String(body.model)
 
@@ -689,15 +1134,24 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   if (!resolved) return json({ error: "no_provider_available" }, 503, cors)
 
   // Forced via prefix — run only that provider. Otherwise walk the list.
-  const isForced = requestedModel.startsWith("omni/") || requestedModel.startsWith("or/")
-  const attemptOrder: Provider[] = isForced ? [resolved.provider] : priority
+  const isForced = requestedModel.startsWith("omni/") || requestedModel.startsWith("or/") || requestedModel.startsWith("aihubmix/") || requestedModel.startsWith("aihub/")
+  let attemptOrder: Provider[] = isForced ? [resolved.provider] : priority
+  if (user.tier === "free" && !isForced && attemptOrder.length > FREE_PROVIDER_ATTEMPT_LIMIT) {
+    attemptOrder = attemptOrder.slice(0, FREE_PROVIDER_ATTEMPT_LIMIT)
+  }
 
   // Pre-flight: if all providers we might use are missing, fail fast.
   if (attemptOrder.includes("openrouter") && !getOpenRouterKey(env)) {
     if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors)
   }
-  if (attemptOrder.includes("omniroute") && (!env.OMNIRoute || !getOmniKey(env))) {
+  if (attemptOrder.includes("omniroute") && (!env.OMNIRoute_WARM || !getOmniKey(env))) {
     if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No OmniRoute key or container binding" }, 500, cors)
+  }
+  if (attemptOrder.includes("aihubmix") && !getAIHubMixKey(env)) {
+    if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No AIHubMix API key configured" }, 500, cors)
+  }
+  if (attemptOrder.includes("cloudflare") && (!env.CLOUDFLARE_ACCOUNT_ID || !getCloudflareKey(env))) {
+    if (attemptOrder.length === 1) return json({ error: "no_api_key", message: "No Cloudflare account ID or API token configured" }, 500, cors)
   }
 
   // Estimate max cost from the FIRST provider's model name. Cost is provider-
@@ -722,8 +1176,17 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     } catch {}
   }
 
+  let freeAdmission: FreeTurnAdmission | undefined
+  const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) })
   try {
-    if (user.tier !== "enterprise") {
+    if (user.tier === "free") {
+      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
+      if (!freeAdmission.allowed) {
+        await releaseLock()
+        return json({ error: freeAdmission.error, message: freeAdmission.message, freeUsage: freeAdmission.snapshot }, 429, responseHeaders())
+      }
+      body = clampFreeRequestBody(body)
+    } else if (billableTier(user.tier)) {
       const balance = await getBalance(user.id, env.ARCANA_PROXY)
       if (balance < maxCost) { await releaseLock(); return json({ error: "insufficient_balance", message: "Add credits via arcana proxy buy", balance, required: Math.round(maxCost) }, 402, cors) }
       await deductBalance(user.id, maxCost, env.ARCANA_PROXY)
@@ -738,7 +1201,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   for (const provider of attemptOrder) {
     attemptedProviders.push(provider)
 
-    if (provider === "omniroute" && env.OMNIRoute) {
+    if (provider === "omniroute" && env.OMNIRoute_WARM) {
       maybeEnqueueOmniWarm(env, ctx)  // best-effort warm-up
     }
 
@@ -757,25 +1220,51 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
         })
         const outbound = { ...body, model: upstreamModel, user: user.id }
         response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
-      } else {
-        providerKey = getOmniKey(env)
-        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_omniroute_key"; continue }
-        // Pre-flight already gated this. The non-null assertion is the contract.
-        const containerId = env.OMNIRoute!.idFromName("primary")
-        const container = env.OMNIRoute!.get(containerId)
+      } else if (provider === "aihubmix") {
+        providerKey = getAIHubMixKey(env)
+        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_aihubmix_key"; continue }
         const headers = new Headers({
           "Content-Type": "application/json",
           Authorization: `Bearer ${providerKey}`,
         })
         const outbound = { ...body, model: upstreamModel, user: user.id }
-        // OmniRoute is OpenAI-compatible — same path scheme. The DO forwards
-        // this Request to the container's defaultPort (8787).
-        response = await container.fetch(new Request(`https://omniroute.local${path}`, { method: "POST", headers, body: JSON.stringify(outbound) }))
+        response = await fetchAIHubMix(path, { method: "POST", headers, body: JSON.stringify(outbound) })
+      } else if (provider === "cloudflare") {
+        providerKey = getCloudflareKey(env)
+        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_cloudflare_key"; continue }
+        const headers = new Headers({
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${providerKey}`,
+        })
+        const outbound = { ...body, model: upstreamModel, user: user.id }
+        response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
+      } else {
+        providerKey = getOmniKey(env)
+        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_omniroute_key"; continue }
+        // OmniRoute is OpenAI-compatible. We can't talk to the container
+        // directly because the container app is owned by the warm Worker
+        // (Cloudflare Containers are 1:1 with their owning Worker). Instead
+        // we send a service-binding RPC to the warm Worker, which forwards
+        // to the container. The warm Worker exposes a single RPC method:
+        //   omFetch(req: Request): Promise<Response>
+        const headers = new Headers({
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${providerKey}`,
+        })
+        const outbound = { ...body, model: upstreamModel, user: user.id }
+        const innerReq = new Request(`https://omniroute.local${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(outbound),
+        })
+        response = await (env.OMNIRoute_WARM as { omFetch: (r: Request) => Promise<Response> }).omFetch(innerReq)
       }
     } catch (e) {
       // Network/timeout — treat as hard fail, try next.
       if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
       if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+      if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
+      if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
       lastErrorStatus = 502
       lastErrorBody = `upstream_unreachable: ${String(e).slice(0, 80)}`
       console.error(`provider ${provider} fetch failed`, e)
@@ -788,33 +1277,39 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       if (hardFail) {
         if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
         if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+        if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
+        if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
         const errorBody = await response.text()
         lastErrorStatus = response.status
         lastErrorBody = errorBody.slice(0, 200)
         console.error(`provider ${provider} hard-fail`, response.status, errorBody.slice(0, 200))
         // Last provider in the list — don't loop forever.
         if (attemptedProviders.length >= attemptOrder.length) {
-          if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
           await releaseLock()
-          return json({ error: "upstream_error", provider, message: lastErrorBody }, lastErrorStatus, cors)
+          return json({ error: "upstream_error", provider, message: lastErrorBody }, lastErrorStatus, responseHeaders())
         }
         continue
       } else {
         // Client-side error (400, 404, etc.) — bubble up as-is, refund nothing.
-        if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+        if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+        ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
         await releaseLock()
         const errorBody = await response.text()
-        return json({ error: "upstream_error", provider, message: errorBody.slice(0, 200) }, response.status, cors)
+        return json({ error: "upstream_error", provider, message: errorBody.slice(0, 200) }, response.status, responseHeaders())
       }
     }
 
     // Success path.
     if (providerKey && provider === "openrouter") markKeySuccess(providerKey)
     if (providerKey && provider === "omniroute") markOmniKeySuccess(providerKey)
+    if (providerKey && provider === "aihubmix") markAIHubMixKeySuccess(providerKey)
+    if (providerKey && provider === "cloudflare") markCloudflareKeySuccess(providerKey)
 
     const adjustBalance = async (tokensIn: number, tokensOut: number, upstreamCost?: number) => {
       const actualCost = upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)
-      if (user.tier !== "enterprise") {
+      if (billableTier(user.tier)) {
         const refund = maxCost - actualCost
         if (refund > 0) await deductBalance(user.id, -refund, env.ARCANA_PROXY)
       }
@@ -853,7 +1348,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           // already seen partial output and a different model's continuation
           // would be a confusing UX. Refund and close.
           if (bytesStreamed > 0) {
-            if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+            if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
           } else if (attemptedProviders.length < attemptOrder.length) {
             // Try the next provider. The client gets an error trailer; the
             // actual retry happens via the failover at the request level
@@ -864,12 +1359,18 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
         } finally {
           await writer.close()
           const usage = extractUsage(fullResponse, resolved.model)
-          if (usage) adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
-          else if (streamFailed && !failoverTriggered && user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          if (usage) {
+            adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
+            const sc = (usage.totalCost ?? estimateCost(resolved.model, usage.inputTokens, usage.outputTokens)) * margin * 100
+            ctx.waitUntil(recordSession(user, resolved.model, provider, usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+            ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
+          }
+          else if (streamFailed && !failoverTriggered && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          if (streamFailed && !failoverTriggered) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
           await releaseLock()
         }
       })()
-      const headers: Record<string, string> = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...cors }
+      const headers: Record<string, string> = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...responseHeaders() }
       headers["X-Provider"] = provider
       return new Response(readable, { status: response.status, headers })
     }
@@ -880,22 +1381,30 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       const tokensOut = data.usage.completion_tokens ?? data.usage.output_tokens ?? 0
       const upstreamCost = data.usage.total_cost
       await adjustBalance(tokensIn, tokensOut, upstreamCost)
+      const sc = (upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)) * margin * 100
+      ctx.waitUntil(recordSession(user, resolved.model, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
     }
+    // When data.usage is absent (some upstreams don't report it), we don't accumulate tokens;
+    // the per-turn input cap and the 10-turn limit are still in force.
+    const settledIn = data?.usage ? (data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0) : 0
+    const settledOut = data?.usage ? (data.usage.completion_tokens ?? data.usage.output_tokens ?? 0) : 0
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, settledIn, settledOut))
     await releaseLock()
-    const successHeaders = { ...cors, "X-Provider": provider }
+    const successHeaders = { ...responseHeaders(), "X-Provider": provider }
     return json(data, response.status, successHeaders)
   }
 
   // All providers in attemptOrder failed.
-  if (user.tier !== "enterprise") await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+  if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+  ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
   await releaseLock()
-  return json({ error: "all_providers_failed", providers: attemptedProviders, lastStatus: lastErrorStatus, message: lastErrorBody }, 502, cors)
+  return json({ error: "all_providers_failed", providers: attemptedProviders, lastStatus: lastErrorStatus, message: lastErrorBody }, 502, responseHeaders())
 }
 // --- end multi-provider failover ---
 
 async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
-    const body = await request.json() as any
+    let body = await request.json() as any
     const amount = Number(body.amount)
     // Idempotency check FIRST — before any PayPal API calls
     const idempotencyKey = request.headers.get("Idempotency-Key")
@@ -930,7 +1439,7 @@ async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionConte
         brand_name: "Arcana",
         user_action: "PAY_NOW",
         shipping_preference: "NO_SHIPPING",
-        return_url: `https://arcana.otnelhq.com/credits/return?token=${order.id}&capture_token=${captureToken}`,
+        return_url: `https://arcana.otnelhq.com/credits/return?capture_token=${captureToken}`,
         cancel_url: "https://arcana.otnelhq.com/credits?cancelled=1",
       }
     }
@@ -969,7 +1478,7 @@ async function handleCreateOrder(request: Request, env: Env, ctx: ExecutionConte
 // Public, order-bound capture for the web Buy Credits flow. PayPal redirects the buyer to
 // /credits/return?token=<orderId>; the buyer's account was bound at create time, so no auth
 // is needed here — we credit the stored account and PayPal blocks any double-capture.
-async function handleCaptureReturn(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+async function handleCaptureReturn(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
     const url = new URL(request.url)
     let orderId = url.searchParams.get("token") ?? url.searchParams.get("orderId")
@@ -1011,6 +1520,7 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
     const newBalance = (existing?.credits ?? 0) + credits
     await env.ARCANA_PROXY.put(`balance:${purchase.creditUserId}`, JSON.stringify({ credits: newBalance, updatedAt: Date.now() }))
     await env.ARCANA_PROXY.put(`purchase:${orderId}`, JSON.stringify({ ...purchase, credits, status: "completed" }), { expirationTtl: 86400 * 30 })
+    ctx.waitUntil(recordPurchase(purchase.creditUserId, orderId, purchase.amount, credits, env.ARCANA_PROXY))
 
     return json({ success: true, creditsAdded: credits, newBalance: Math.round(newBalance) }, 200, cors)
   } catch (e) {
@@ -1020,7 +1530,7 @@ async function handleCaptureReturn(request: Request, env: Env, cors: Record<stri
 
 async function handleCaptureOrder(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
   try {
-    const body = await request.json() as any
+    let body = await request.json() as any
     const { orderId } = body
     if (!orderId) return json({ error: "Missing orderId" }, 400, cors)
 
@@ -1057,6 +1567,7 @@ async function handleCaptureOrder(request: Request, env: Env, ctx: ExecutionCont
     const currentCredits = existing?.credits ?? 0
     await env.ARCANA_PROXY.put(`balance:${creditTarget}`, JSON.stringify({ credits: currentCredits + credits, updatedAt: Date.now() }))
     await env.ARCANA_PROXY.put(`purchase:${orderId}`, JSON.stringify({ ...(purchase ?? {}), creditUserId: creditTarget, amount, credits, status: "completed" }), { expirationTtl: 86400 * 30 })
+    ctx.waitUntil(recordPurchase(creditTarget, orderId, amount, credits, env.ARCANA_PROXY))
 
     // Send receipt email (fire-and-forget)
     const email = request.headers.get("X-Receipt-Email")
@@ -1373,7 +1884,16 @@ function adminAuthorized(request: Request, env: Env): boolean {
 
 async function handleAdminGetProviders(env: Env, cors: Record<string, string>): Promise<Response> {
   const stored = await env.ARCANA_PROXY.get("provider:priority", "json") as Provider[] | null
-  return json({ priority: stored ?? ["openrouter"], containerConfigured: Boolean(env.OMNIRoute) }, 200, cors)
+  return json({
+    priority: stored ?? ["openrouter"],
+    containerConfigured: Boolean(env.OMNIRoute_WARM),
+    providers: {
+      openrouter: { configured: Boolean(env.OPENROUTER_KEYS || env.OPENROUTER_KEY) },
+      omniroute: { configured: Boolean(env.OMNIRoute_WARM && (env.OMNIRoute_KEYS || env.OMNIRoute_KEY)) },
+      aihubmix: { configured: Boolean(env.AIHUBMIX_KEYS || env.AIHUBMIX_KEY), baseURL: AIHUBMIX_URL, fallbackBaseURL: AIHUBMIX_FALLBACK_URL },
+      cloudflare: { configured: Boolean((env.CLOUDFLARE_KEYS || env.CLOUDFLARE_KEY) && env.CLOUDFLARE_ACCOUNT_ID), baseURL: cloudflareBaseURL({ CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID } as Env) },
+    },
+  }, 200, cors)
 }
 
 async function handleAdminSetProviders(request: Request, env: Env, ctx: ExecutionContext, cors: Record<string, string>): Promise<Response> {
@@ -1382,10 +1902,16 @@ async function handleAdminSetProviders(request: Request, env: Env, ctx: Executio
   const priority = body?.priority
   if (!Array.isArray(priority) || priority.length === 0) return json({ error: "priority_must_be_nonempty_array" }, 400, cors)
   // Whitelist — never trust caller-provided provider names.
-  const filtered = priority.filter((p): p is Provider => p === "openrouter" || p === "omniroute")
+  const filtered = priority.filter(isProvider)
   if (filtered.length === 0) return json({ error: "no_valid_providers" }, 400, cors)
-  if (filtered.includes("omniroute") && !env.OMNIRoute) {
-    return json({ error: "omniroute_not_configured", message: "OMNIRoute DO binding is missing — deploy the warm Worker first" }, 400, cors)
+  if (filtered.includes("omniroute") && !env.OMNIRoute_WARM) {
+    return json({ error: "omniroute_not_configured", message: "OMNIRoute service binding is missing — deploy the warm Worker first" }, 400, cors)
+  }
+  if (filtered.includes("aihubmix") && !(env.AIHUBMIX_KEYS || env.AIHUBMIX_KEY)) {
+    return json({ error: "aihubmix_not_configured", message: "AIHUBMIX_KEYS or AIHUBMIX_KEY must be configured first" }, 400, cors)
+  }
+  if (filtered.includes("cloudflare") && (!(env.CLOUDFLARE_KEYS || env.CLOUDFLARE_KEY) || !env.CLOUDFLARE_ACCOUNT_ID)) {
+    return json({ error: "cloudflare_not_configured", message: "CLOUDFLARE_KEYS/CLOUDFLARE_KEY and CLOUDFLARE_ACCOUNT_ID must be configured first" }, 400, cors)
   }
   // 1-hour TTL doubles as a cache bust for stale isolates that already cached
   // the priority list in memory.
@@ -1528,6 +2054,66 @@ async function handleTrialStart(request: Request, env: Env, cors: Record<string,
   return json({ token, tier: "pro", expiresAt: new Date(trial.expiresAt).toISOString(), expiresIn: "14 days" }, 200, cors)
 }
 
+async function recordSession(user: { id: string }, model: string, provider: string, tokensIn: number, tokensOut: number, costCredits: number, durationMs: number, status: "completed" | "failed" | "streamed", messageCount: number, kv: KVNamespace): Promise<void> {
+  const sessionId = crypto.randomUUID()
+  const createdAt = new Date().toISOString()
+  const summary = { id: sessionId, model, provider, tokensIn, tokensOut, costCredits, durationMs, createdAt, status, messageCount }
+  const detail = { ...summary, userId: user.id, summary: "(generated)", firstMessage: "", lastMessage: "" }
+  try {
+    await kv.put(`session:${sessionId}`, JSON.stringify(detail), { expirationTtl: 86400 * 90 })
+    const raw = await kv.get(`user_sessions:${user.id}`, "json") as any[] || []
+    raw.unshift(summary)
+    if (raw.length > 50) raw.length = 50
+    await kv.put(`user_sessions:${user.id}`, JSON.stringify(raw), { expirationTtl: 86400 * 90 })
+  } catch {}
+}
+
+async function recordPurchase(userId: string, orderId: string, amount: number, credits: number, kv: KVNamespace): Promise<void> {
+  try {
+    const raw = await kv.get(`user_purchases:${userId}`, "json") as any[] || []
+    raw.unshift({ orderId, amount, credits, status: "completed", createdAt: new Date().toISOString(), paymentMethod: "paypal" })
+    if (raw.length > 100) raw.length = 100
+    await kv.put(`user_purchases:${userId}`, JSON.stringify(raw), { expirationTtl: 86400 * 365 })
+  } catch {}
+}
+
+async function handleGetSessions(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const url = new URL(request.url)
+  const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50"), 50)
+  const raw = await env.ARCANA_PROXY.get(`user_sessions:${user.id}`, "json") as any[] || []
+  const sessions = raw.slice(0, limit)
+  return json({ sessions, total: raw.length }, 200, cors)
+}
+
+async function handleGetSessionDetail(sessionId: string, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const session = await env.ARCANA_PROXY.get(`session:${sessionId}`, "json") as any
+  if (!session) return json({ error: "not_found" }, 404, cors)
+  if (session.userId !== user.id) return json({ error: "forbidden" }, 403, cors)
+  return json(session, 200, cors)
+}
+
+async function handleGetPurchases(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const raw = await env.ARCANA_PROXY.get(`user_purchases:${user.id}`, "json") as any[] || []
+  return json({ purchases: raw }, 200, cors)
+}
+
+async function handleGetProfile(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const profile = await env.ARCANA_PROXY.get(`profile:${user.id}`, "json") as any
+  return json(profile ?? { displayName: "", theme: "dark", notifications: { emailReceipts: true, usageAlerts: false } }, 200, cors)
+}
+
+async function handlePutProfile(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  let body = await request.json() as any
+  const allowed = ["displayName", "theme", "notifications"]
+  const clean: any = {}
+  for (const key of allowed) {
+    if (body[key] !== undefined) clean[key] = body[key]
+  }
+  clean.updatedAt = Date.now()
+  await env.ARCANA_PROXY.put(`profile:${user.id}`, JSON.stringify(clean))
+  return json({ ok: true, profile: clean }, 200, cors)
+}
+
 async function handleGetBalance(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   const credits = await getBalance(user.id, env.ARCANA_PROXY)
   return json({ userId: user.id, credits: Math.round(credits), dollars: (credits / 100).toFixed(2) }, 200, cors)
@@ -1564,14 +2150,79 @@ async function handleSendTestReceipt(request: Request, env: Env, user: { id: str
   }
 }
 
+function prefixedModelList(data: any, prefix: string, ownedBy: string): any[] {
+  const models = Array.isArray(data?.data) ? data.data : []
+  return models
+    .filter((model: any) => model && typeof model.id === "string")
+    .map((model: any) => ({ ...model, id: `${prefix}${model.id}`, owned_by: model.owned_by ?? ownedBy }))
+}
+
 async function listModels(env: Env, cors: Record<string, string>): Promise<Response> {
-  const key = getOpenRouterKey(env)
-  if (!key) return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, cors)
-  const response = await fetch(`${OPENROUTER_URL}/v1/models`, { headers: { Authorization: `Bearer ${key}` } })
-  if (response.ok) markKeySuccess(key)
-  else if (response.status === 429 || response.status === 401) markKeyRateLimited(key)
-  const data = await response.json()
-  return json(data, response.status, cors)
+  const models: any[] = []
+  const errors: Array<{ provider: Provider; status: number; message: string }> = []
+
+  const openRouterKey = getOpenRouterKey(env)
+  if (openRouterKey) {
+    try {
+      const response = await fetch(`${OPENROUTER_URL}/v1/models`, { headers: { Authorization: `Bearer ${openRouterKey}` } })
+      if (response.ok) {
+        markKeySuccess(openRouterKey)
+        const data = await response.json() as any
+        if (Array.isArray(data?.data)) models.push(...data.data)
+      } else {
+        if (response.status === 429 || response.status === 401) markKeyRateLimited(openRouterKey)
+        errors.push({ provider: "openrouter", status: response.status, message: (await response.text()).slice(0, 160) })
+      }
+    } catch (error) {
+      markKeyRateLimited(openRouterKey)
+      errors.push({ provider: "openrouter", status: 502, message: String(error).slice(0, 160) })
+    }
+  }
+
+  const aiHubMixKey = getAIHubMixKey(env)
+  if (aiHubMixKey) {
+    try {
+      const response = await fetchAIHubMix("/v1/models", { headers: { Authorization: `Bearer ${aiHubMixKey}` } })
+      if (response.ok) {
+        markAIHubMixKeySuccess(aiHubMixKey)
+        const data = await response.json() as any
+        models.push(...prefixedModelList(data, "aihubmix/", "aihubmix"))
+      } else {
+        if (response.status === 429 || response.status === 401) markAIHubMixKeyRateLimited(aiHubMixKey)
+        errors.push({ provider: "aihubmix", status: response.status, message: (await response.text()).slice(0, 160) })
+      }
+    } catch (error) {
+      markAIHubMixKeyRateLimited(aiHubMixKey)
+      errors.push({ provider: "aihubmix", status: 502, message: String(error).slice(0, 160) })
+    }
+  }
+
+  const cloudflareKey = getCloudflareKey(env)
+  if (cloudflareKey && env.CLOUDFLARE_ACCOUNT_ID) {
+    try {
+      const response = await fetch(`${cloudflareBaseURL(env)}/v1/models`, { headers: { Authorization: `Bearer ${cloudflareKey}` } })
+      if (response.ok) {
+        markCloudflareKeySuccess(cloudflareKey)
+        const data = await response.json() as any
+        // Workers AI returns { result: [...] } (Cloudflare-native) or { data: [...] } (OpenAI-compat).
+        // Normalise to a list, then prefix with "cloudflare/" so the client catalog can disambiguate.
+        const raw = Array.isArray(data?.data) ? data.data : (Array.isArray(data?.result) ? data.result : [])
+        for (const m of raw) {
+          if (m && typeof m.id === "string") models.push({ ...m, id: `cloudflare/${m.id}`, owned_by: "cloudflare" })
+          else if (m && typeof m.name === "string") models.push({ ...m, id: `cloudflare/${m.name}`, owned_by: "cloudflare" })
+        }
+      } else {
+        if (response.status === 429 || response.status === 401) markCloudflareKeyRateLimited(cloudflareKey)
+        errors.push({ provider: "cloudflare", status: response.status, message: (await response.text()).slice(0, 160) })
+      }
+    } catch (error) {
+      markCloudflareKeyRateLimited(cloudflareKey)
+      errors.push({ provider: "cloudflare", status: 502, message: String(error).slice(0, 160) })
+    }
+  }
+  if (models.length > 0) return json({ object: "list", data: models }, 200, cors)
+  if (errors.length > 0) return json({ error: "models_unavailable", providers: errors }, 502, cors)
+  return json({ error: "no_api_key", message: "No provider API key configured" }, 500, cors)
 }
 
 async function getUserUsage(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {

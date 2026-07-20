@@ -28,6 +28,12 @@
     { "name": "EMAIL" }
   ],
 
+  // Cloudflare Workers AI — account ID is a public identifier, lives in `vars` (not a secret).
+  // The Workers AI Read token is set with `wrangler secret put CLOUDFLARE_KEY` (or CLOUDFLARE_KEYS).
+  "vars": {
+    "CLOUDFLARE_ACCOUNT_ID": ""
+  },
+
   // ---------------------------------------------------------------------------
   // OmniRoute Durable Object binding.
   // The class (`OmniRouteContainer`) is defined and exported by the warm
@@ -37,14 +43,21 @@
   // Until that Worker is deployed, the binding is undefined and the priority
   // list is forced to ["openrouter"] in code.
   // ---------------------------------------------------------------------------
-  "durable_objects": {
-    "bindings": [
-      { "name": "OMNIRoute", "class_name": "OmniRouteContainer" }
-    ]
-  },
+  "migrations": [],
 
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["OmniRouteContainer"] }
+  // ---------------------------------------------------------------------------
+  // The container is owned by the warm Worker (`arcana-omniroute-warm`,
+  // defined by wrangler.warm.jsonc). Cloudflare Containers are 1:1 with
+  // their owning Worker — adding a `containers` block here would create a
+  // SECOND container app, separate DO namespace, and the proxy's runtime
+  // would still need its own Container-enabled class to call into it.
+  //
+  // The proxy reaches the container via a service binding to the warm
+  // Worker; the warm Worker exposes an `omFetch` RPC that forwards to the
+  // container. No `durable_objects` binding is needed here.
+  // ---------------------------------------------------------------------------
+  "services": [
+    { "binding": "OMNIRoute_WARM", "service": "arcana-omniroute-warm" }
   ],
 
   // ---------------------------------------------------------------------------
@@ -76,17 +89,27 @@
       "workers_dev": true,
       "routes": [],
       "vars": {
-        "PAYPAL_SANDBOX": "true"
+        "PAYPAL_SANDBOX": "true",
+        "CLOUDFLARE_ACCOUNT_ID": ""
       },
       "kv_namespaces": [
-        { "binding": "ARCANA_PROXY", "id": "8c183296c8a14bd6857b1c896e7e5c3c" }
+        { "binding": "ARCANA_PROXY", "id": "8c183296c8a14bd6857b1c896e7e5c3c" },
+        { "binding": "ARCANA_LICENSE", "id": "63e54bc7b2e8405cb4db5d926e1f2685" }
       ],
       "analytics_engine_datasets": [
         { "binding": "ARCANA_PROXY_ANALYTICS", "dataset": "arcana_proxy_usage" }
       ],
       "send_email": [
         { "name": "EMAIL" }
-      ]
+      ],
+      "services": [
+        { "binding": "OMNIRoute_WARM", "service": "arcana-omniroute-warm" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "OMNIRoute_WARM_QUEUE", "queue": "arcana-omniroute-warm" }
+        ]
+      }
     }
   }
 }
