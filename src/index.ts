@@ -1087,7 +1087,15 @@ export default {
           if (request.method === "PUT") return handlePutProfile(request, user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/health":
-          return json({ status: "ok", service: "arcana-proxy", user: user.id, tier: user.tier }, 200, corsHeaders)
+          return json({
+            status: "ok",
+            service: "arcana-proxy",
+            user: user.id,
+            tier: user.tier,
+            // Build marker so we can verify deploy (workspace GETs must not free-burst)
+            build: "2026-07-20-rl-workspace",
+            freeBurstOnly: ["/v1/chat/completions", "/v1/embeddings"],
+          }, 200, corsHeaders)
         default:
           return json({ error: "not_found" }, 404, corsHeaders)
       }
