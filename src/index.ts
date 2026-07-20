@@ -350,8 +350,12 @@ const freeIpLimits = new Map<string, { count: number; resetAt: number }>()
 const freeUserLimits = new Map<string, { count: number; resetAt: number }>()
 const IP_RATE_LIMIT = 50
 const USER_RATE_LIMIT = 25
+// Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
+// Workspace GETs (balance, sessions, memory, profile) must not share this bucket —
+// a single dashboard load is already 3–5 parallel requests and used to 429 at 8/min.
 const FREE_IP_RATE_LIMIT = 20
-const FREE_USER_RATE_LIMIT = 8
+const FREE_USER_RATE_LIMIT = 12
+const FREE_BURST_PATHS = new Set(["/v1/chat/completions", "/v1/embeddings"])
 const RATE_WINDOW = 60000
 
 // Daily usage limits by tier
@@ -946,7 +950,7 @@ export default {
       : "https://arcana.otnelhq.com"
     const corsHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": allowedOrigin,
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Arcana-Request, X-Arcana-Turn, X-Arcana-Turn-Id, X-Arcana-Session, X-Arcana-Session-Id",
     }
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders })
@@ -1003,18 +1007,23 @@ export default {
       const user = await getUser(request.headers.get("Authorization"), env.ARCANA_PROXY, ctx, env)
       if (!user) return json({ error: "unauthorized" }, 401, corsHeaders)
 
-      // User rate limiting (per-minute)
+      // User rate limiting (per-minute) — all authenticated routes
       const userRl = checkRateLimit(user.id, userLimits, USER_RATE_LIMIT)
       if (!userRl.allowed) return json({ error: "rate_limited", message: "25 req/min per user" }, 429, corsHeaders)
-      if (user.tier === "free") {
+
+      const isLlmPath = FREE_BURST_PATHS.has(url.pathname)
+
+      // Free-tier burst limits only on LLM routes (chat/embeddings). Workspace
+      // reads (balance/sessions/memory/profile) stay under the general 25/min cap.
+      if (user.tier === "free" && isLlmPath) {
         const freeIpRl = checkRateLimit(`free:${clientIp}`, freeIpLimits, FREE_IP_RATE_LIMIT)
         if (!freeIpRl.allowed) return json({ error: "rate_limited", message: "Free IP burst limit exceeded: 20 req/min" }, 429, corsHeaders)
         const freeUserRl = checkRateLimit(`free:${user.id}`, freeUserLimits, FREE_USER_RATE_LIMIT)
-        if (!freeUserRl.allowed) return json({ error: "rate_limited", message: "Free user burst limit exceeded: 8 req/min" }, 429, corsHeaders)
+        if (!freeUserRl.allowed) return json({ error: "rate_limited", message: `Free user burst limit exceeded: ${FREE_USER_RATE_LIMIT} req/min` }, 429, corsHeaders)
       }
 
-      // Daily usage limit (per-tier)
-      if (user.tier !== "enterprise") {
+      // Daily usage limit (per-tier) — only count LLM traffic, not dashboard polls
+      if (user.tier !== "enterprise" && isLlmPath) {
         const daily = await checkDailyLimit(user.id, user.tier, env.ARCANA_PROXY)
         if (!daily.allowed) {
           return json({
@@ -1025,7 +1034,7 @@ export default {
             remaining: 0,
           }, 429, corsHeaders)
         }
-        // Add remaining quota to response headers for all requests below
+        // Add remaining quota to response headers for LLM requests
         if (daily.remaining < 50) {
           corsHeaders["X-RateLimit-Remaining"] = String(daily.remaining)
         }
