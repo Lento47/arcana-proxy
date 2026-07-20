@@ -31,6 +31,8 @@ Endpoints:
 | `/v1/balance` | GET | Caller's credit balance |
 | `/v1/sessions` | GET | Caller's session history (paginated) |
 | `/v1/sessions/<id>` | GET | Single session detail (UUID in path) |
+| `/v1/memory` | GET, PUT/POST, DELETE | Personal cloud memory facts (CLI sync + web) |
+| `/v1/memory/<key>` | DELETE | Delete one memory fact by key |
 | `/v1/purchases` | GET | Caller's purchase history |
 | `/v1/profile` | GET, PUT | Caller's profile |
 | `/v1/free-usage/sessions/current` | GET | Authoritative free-tier status for the calling user |

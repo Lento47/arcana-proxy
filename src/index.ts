@@ -811,9 +811,11 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
 
   const raw = await kvGetJson<any>(kv, licenseKvKey)
   if (raw) {
-    // Normalize to {id, tier} — never promote raw blobs as user.id if missing.
+    // Prefer supabaseUserId so device-flow CLI keys share the same subject as
+    // Supabase JWT web sessions (memory / sessions / balance stay unified).
+    // Fall back to email / legacy id for older license records.
     const normalized = {
-      id: String(raw.id ?? raw.email ?? key.slice(0, 12)),
+      id: String(raw.supabaseUserId ?? raw.id ?? raw.email ?? key.slice(0, 12)),
       tier: String(raw.tier ?? "free"),
     }
     licenseCache.set(key, normalized)
@@ -1035,6 +1037,14 @@ export default {
         return handleGetSessionDetail(sessionMatch[1], user, env, corsHeaders)
       }
 
+      // Match /v1/memory/:key (DELETE single fact by key)
+      const memoryKeyMatch = url.pathname.match(/^\/v1\/memory\/(.+)$/)
+      if (memoryKeyMatch) {
+        const factKey = decodeURIComponent(memoryKeyMatch[1]!)
+        if (request.method === "DELETE") return handleDeleteMemoryFact(factKey, user, env, corsHeaders)
+        return json({ error: "method_not_allowed" }, 405, corsHeaders)
+      }
+
       switch (url.pathname) {
         case "/v1/chat/completions":
         case "/v1/embeddings":
@@ -1054,6 +1064,11 @@ export default {
           return handleResolveEmail(request, env, corsHeaders)
         case "/v1/sessions":
           if (request.method === "GET") return handleGetSessions(request, user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        case "/v1/memory":
+          if (request.method === "GET") return handleGetMemory(request, user, env, corsHeaders)
+          if (request.method === "PUT" || request.method === "POST") return handlePutMemory(request, user, env, corsHeaders)
+          if (request.method === "DELETE") return handleClearMemory(request, user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/purchases":
           if (request.method === "GET") return handleGetPurchases(user, env, corsHeaders)
@@ -1191,7 +1206,7 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
         if (usage) {
           adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
           const sc = (usage.totalCost ?? estimateCost(body.model, usage.inputTokens, usage.outputTokens)) * margin * 100
-          ctx.waitUntil(recordSession(user, body.model, "openrouter", usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+          ctx.waitUntil(recordSession(user, body.model, "openrouter", usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
           ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
         }
         else if (streamFailed && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
@@ -1210,7 +1225,7 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
     const openRouterCost = data.usage.total_cost // OpenRouter's actual cost in USD
     await adjustBalance(tokensIn, tokensOut, openRouterCost)
     const sc = (openRouterCost ?? estimateCost(body.model, tokensIn, tokensOut)) * margin * 100
-    ctx.waitUntil(recordSession(user, body.model, "openrouter", tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+    ctx.waitUntil(recordSession(user, body.model, "openrouter", tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
   }
   ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut))
   await releaseLock()
@@ -1471,7 +1486,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           if (usage) {
             adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
             const sc = (usage.totalCost ?? estimateCost(resolved.model, usage.inputTokens, usage.outputTokens)) * margin * 100
-            ctx.waitUntil(recordSession(user, resolved.model, provider, usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+            ctx.waitUntil(recordSession(user, resolved.model, provider, usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
             ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
           }
           else if (streamFailed && !failoverTriggered && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
@@ -1491,7 +1506,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       const upstreamCost = data.usage.total_cost
       await adjustBalance(tokensIn, tokensOut, upstreamCost)
       const sc = (upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)) * margin * 100
-      ctx.waitUntil(recordSession(user, resolved.model, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY))
+      ctx.waitUntil(recordSession(user, resolved.model, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
     }
     // When data.usage is absent (some upstreams don't report it), we don't accumulate tokens;
     // the per-turn input cap and the 10-turn limit are still in force.
@@ -2239,11 +2254,56 @@ async function handleTrialStart(request: Request, env: Env, cors: Record<string,
   return json({ token, tier: "pro", expiresAt: new Date(trial.expiresAt).toISOString(), expiresIn: "14 days" }, 200, cors)
 }
 
-async function recordSession(user: { id: string }, model: string, provider: string, tokensIn: number, tokensOut: number, costCredits: number, durationMs: number, status: "completed" | "failed" | "streamed", messageCount: number, kv: KVNamespace): Promise<void> {
+/** Truncated preview of the first user message in a chat body (for session list UX). */
+function previewUserMessage(messages: unknown): string {
+  if (!Array.isArray(messages)) return ""
+  for (const m of messages) {
+    if (!m || typeof m !== "object" || (m as any).role !== "user") continue
+    const c = (m as any).content
+    let text = ""
+    if (typeof c === "string") text = c
+    else if (Array.isArray(c)) {
+      text = c
+        .map((p: any) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join(" ")
+    }
+    text = text.replace(/\s+/g, " ").trim()
+    if (text) return text.slice(0, 240)
+  }
+  return ""
+}
+
+async function recordSession(
+  user: { id: string },
+  model: string,
+  provider: string,
+  tokensIn: number,
+  tokensOut: number,
+  costCredits: number,
+  durationMs: number,
+  status: "completed" | "failed" | "streamed",
+  messageCount: number,
+  kv: KVNamespace,
+  opts?: { firstMessage?: string },
+): Promise<void> {
   const sessionId = crypto.randomUUID()
   const createdAt = new Date().toISOString()
-  const summary = { id: sessionId, model, provider, tokensIn, tokensOut, costCredits, durationMs, createdAt, status, messageCount }
-  const detail = { ...summary, userId: user.id, summary: "(generated)", firstMessage: "", lastMessage: "" }
+  const firstMessage = (opts?.firstMessage ?? "").slice(0, 240)
+  const summary = {
+    id: sessionId,
+    model,
+    provider,
+    tokensIn,
+    tokensOut,
+    costCredits,
+    durationMs,
+    createdAt,
+    status,
+    messageCount,
+    firstMessage,
+  }
+  const detail = { ...summary, userId: user.id, summary: firstMessage || "(no preview)" }
   try {
     await kv.put(`session:${sessionId}`, JSON.stringify(detail), { expirationTtl: 86400 * 90 })
     const raw = await kv.get(`user_sessions:${user.id}`, "json") as any[] || []
@@ -2275,6 +2335,164 @@ async function handleGetSessionDetail(sessionId: string, user: { id: string }, e
   if (!session) return json({ error: "not_found" }, 404, cors)
   if (session.userId !== user.id) return json({ error: "forbidden" }, 403, cors)
   return json(session, 200, cors)
+}
+
+// --- Personal cloud memory (facts synced from CLI / edited on web) ---
+// Stored as a single KV value per user. Caps keep payloads small.
+
+type CloudFact = {
+  id: string
+  key: string
+  value: string
+  source?: string
+  confidence: number
+  createdAt: string
+  updatedAt: string
+}
+
+const MEMORY_MAX_FACTS = 200
+const MEMORY_VALUE_MAX = 2000
+const MEMORY_KEY_MAX = 120
+const MEMORY_TTL = 86400 * 365 // 1 year
+
+function memoryKvKey(userId: string): string {
+  return `user_memory:${userId}`
+}
+
+function sanitizeFactKey(raw: unknown): string | null {
+  if (typeof raw !== "string") return null
+  const key = raw.trim().slice(0, MEMORY_KEY_MAX)
+  if (!key || key.length > MEMORY_KEY_MAX) return null
+  // Reject path separators / control chars that break DELETE routing or logs
+  if (/[\u0000-\u001f\\/]/.test(key)) return null
+  return key
+}
+
+function normalizeCloudFact(input: any, fallbackTs: string): CloudFact | null {
+  const key = sanitizeFactKey(input?.key)
+  if (!key) return null
+  const value = String(input?.value ?? "").trim().slice(0, MEMORY_VALUE_MAX)
+  if (!value) return null
+  const confidence = typeof input?.confidence === "number"
+    ? Math.max(0, Math.min(1, input.confidence))
+    : 1
+  const updatedAt = typeof input?.updatedAt === "string" && input.updatedAt
+    ? input.updatedAt
+    : (typeof input?.updated_at === "string" && input.updated_at ? input.updated_at : fallbackTs)
+  const createdAt = typeof input?.createdAt === "string" && input.createdAt
+    ? input.createdAt
+    : (typeof input?.created_at === "string" && input.created_at ? input.created_at : updatedAt)
+  const source = typeof input?.source === "string" ? input.source.slice(0, 80) : undefined
+  const id = typeof input?.id === "string" && input.id ? String(input.id).slice(0, 64) : crypto.randomUUID()
+  return { id, key, value, source, confidence, createdAt, updatedAt }
+}
+
+async function loadUserMemory(userId: string, kv: KVNamespace): Promise<CloudFact[]> {
+  const raw = await kv.get(memoryKvKey(userId), "json") as CloudFact[] | null
+  return Array.isArray(raw) ? raw : []
+}
+
+async function saveUserMemory(userId: string, facts: CloudFact[], kv: KVNamespace): Promise<void> {
+  // Newest first, hard cap
+  facts.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
+  if (facts.length > MEMORY_MAX_FACTS) facts.length = MEMORY_MAX_FACTS
+  await kv.put(memoryKvKey(userId), JSON.stringify(facts), { expirationTtl: MEMORY_TTL })
+}
+
+async function handleGetMemory(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const url = new URL(request.url)
+  const q = (url.searchParams.get("q") ?? "").trim().toLowerCase()
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), MEMORY_MAX_FACTS)
+  let facts = await loadUserMemory(user.id, env.ARCANA_PROXY)
+  if (q) {
+    facts = facts.filter((f) =>
+      f.key.toLowerCase().includes(q) ||
+      f.value.toLowerCase().includes(q) ||
+      (f.source ?? "").toLowerCase().includes(q),
+    )
+  }
+  const total = facts.length
+  return json({ facts: facts.slice(0, limit), total }, 200, cors)
+}
+
+async function handlePutMemory(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  let body: any
+  try {
+    body = await request.json()
+  } catch {
+    return json({ error: "invalid_json" }, 400, cors)
+  }
+
+  const now = new Date().toISOString()
+  const incoming: any[] = Array.isArray(body?.facts)
+    ? body.facts
+    : (body?.key != null ? [body] : [])
+
+  if (!incoming.length) {
+    return json({ error: "facts_required", message: "Provide { facts: [...] } or a single { key, value } object." }, 400, cors)
+  }
+  if (incoming.length > MEMORY_MAX_FACTS) {
+    return json({ error: "too_many_facts", message: `Max ${MEMORY_MAX_FACTS} facts per request.` }, 400, cors)
+  }
+
+  const existing = await loadUserMemory(user.id, env.ARCANA_PROXY)
+  const byKey = new Map<string, CloudFact>()
+  for (const f of existing) byKey.set(f.key, f)
+
+  let merged = 0
+  let skipped = 0
+  for (const raw of incoming) {
+    const fact = normalizeCloudFact(raw, now)
+    if (!fact) { skipped++; continue }
+    const prev = byKey.get(fact.key)
+    // Last-write-wins by updatedAt; equal timestamp prefers incoming
+    if (!prev || fact.updatedAt >= prev.updatedAt) {
+      // Preserve original createdAt when updating same key
+      if (prev && (!raw?.createdAt && !raw?.created_at)) {
+        fact.createdAt = prev.createdAt
+        fact.id = prev.id
+      }
+      byKey.set(fact.key, fact)
+      merged++
+    } else {
+      skipped++
+    }
+  }
+
+  const next = Array.from(byKey.values())
+  await saveUserMemory(user.id, next, env.ARCANA_PROXY)
+  return json({ ok: true, merged, skipped, total: next.length }, 200, cors)
+}
+
+async function handleDeleteMemoryFact(factKey: string, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const key = sanitizeFactKey(factKey)
+  if (!key) return json({ error: "invalid_key" }, 400, cors)
+  const existing = await loadUserMemory(user.id, env.ARCANA_PROXY)
+  const next = existing.filter((f) => f.key !== key)
+  if (next.length === existing.length) return json({ error: "not_found" }, 404, cors)
+  await saveUserMemory(user.id, next, env.ARCANA_PROXY)
+  return json({ ok: true, deleted: key, total: next.length }, 200, cors)
+}
+
+async function handleClearMemory(request: Request, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const url = new URL(request.url)
+  const keyParam = url.searchParams.get("key")
+  if (keyParam) return handleDeleteMemoryFact(keyParam, user, env, cors)
+
+  // Body optional: { key: "..." } deletes one; { confirm: true } clears all
+  let body: any = {}
+  try {
+    const text = await request.text()
+    if (text) body = JSON.parse(text)
+  } catch {
+    return json({ error: "invalid_json" }, 400, cors)
+  }
+  if (body?.key) return handleDeleteMemoryFact(String(body.key), user, env, cors)
+  if (body?.confirm === true || body?.all === true) {
+    await env.ARCANA_PROXY.delete(memoryKvKey(user.id))
+    return json({ ok: true, cleared: true, total: 0 }, 200, cors)
+  }
+  return json({ error: "confirm_required", message: "Pass ?key= or body { key } to delete one, or { confirm: true } to clear all." }, 400, cors)
 }
 
 async function handleGetPurchases(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
