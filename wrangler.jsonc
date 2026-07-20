@@ -12,7 +12,10 @@
   "workers_dev": true,
 
   "routes": [
-    { "pattern": "proxy.arcana.otnelhq.com/v1/*", "zone_id": "3c5d5afdbd04d5fda736a13e8008d659" }
+    // First-level subdomain — Universal SSL works. Multi-level proxy.arcana.otnelhq.com
+    // needs Advanced Certificate Manager (TLS handshake fails without it).
+    { "pattern": "proxy-arcana.otnelhq.com/*", "zone_id": "3c5d5afdbd04d5fda736a13e8008d659" },
+    { "pattern": "proxy.arcana.otnelhq.com/*", "zone_id": "3c5d5afdbd04d5fda736a13e8008d659" }
   ],
 
   "kv_namespaces": [
