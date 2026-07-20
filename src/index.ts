@@ -367,7 +367,10 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
   const limit = DAILY_LIMITS[tier] ?? DAILY_LIMITS.free
   if (limit === Infinity) return { allowed: true, remaining: Infinity }
   const date = new Date().toISOString().split("T")[0]!
-  const key = `usage:daily:${userId}:${date}`
+  // Never put a raw JWT/long id into a KV key (usage:daily:<id>:<date>).
+  const subject = utf8Len(userId) > 80 ? (await sha256Hex(userId)).slice(0, 40) : userId
+  const key = `usage:daily:${subject}:${date}`
+  if (!kvKeyOk(key)) return { allowed: true, remaining: limit } // fail open rather than 500
   const current = parseInt((await kv.get(key)) ?? "0")
   if (current >= limit) return { allowed: false, remaining: 0 }
   const remaining = limit - current - 1
@@ -688,82 +691,159 @@ async function verifySupabaseJWT(token: string): Promise<{ sub: string; email: s
   return { sub: payload.sub, email: payload.email || "" }
 }
 
+/** Cloudflare KV rejects keys longer than 512 UTF-8 bytes (error 414). */
+const KV_KEY_MAX_BYTES = 512
+
+function utf8Len(s: string): number {
+  // TextEncoder is available in Workers; length in bytes, not JS string length.
+  return new TextEncoder().encode(s).length
+}
+
+function kvKeyOk(key: string): boolean {
+  return utf8Len(key) <= KV_KEY_MAX_BYTES
+}
+
+/** Safe KV get — never calls KV with an oversized key (returns null instead of 500). */
+async function kvGetJson<T = unknown>(kv: KVNamespace, key: string): Promise<T | null> {
+  if (!kvKeyOk(key)) {
+    console.error(`[kv] refused GET: key is ${utf8Len(key)} bytes (max ${KV_KEY_MAX_BYTES}): ${key.slice(0, 48)}…`)
+    return null
+  }
+  return (await kv.get(key, "json")) as T | null
+}
+
+async function kvPutJson(kv: KVNamespace, key: string, value: unknown, options?: KVNamespacePutOptions): Promise<boolean> {
+  if (!kvKeyOk(key)) {
+    console.error(`[kv] refused PUT: key is ${utf8Len(key)} bytes (max ${KV_KEY_MAX_BYTES}): ${key.slice(0, 48)}…`)
+    return false
+  }
+  await kv.put(key, JSON.stringify(value), options)
+  return true
+}
+
+function listAdminKeys(env?: Env): string[] {
+  if (!env) return []
+  const raw = (env.ARCANA_ADMIN_KEYS || env.ARCANA_ADMIN_KEY || "").trim()
+  if (!raw) return []
+  return raw.split(",").map((k) => k.trim()).filter(Boolean)
+}
+
 async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionContext, env?: Env): Promise<{ id: string; tier: string } | null> {
   if (!auth || !auth.startsWith("Bearer ")) return null
   const key = auth.slice(7).trim()
   if (!key) return null
   const now = Date.now()
 
-  // Trial tokens — ephemeral, no caching
+  // ── 1. Admin keys FIRST ──────────────────────────────────────────────
+  // Defense-in-depth: never use the raw bearer as a KV key for admins.
+  // (A 44-char admin key makes license:<key> only ~52 bytes — well under the
+  // CF 512-byte limit. The historical 999-byte 414 was license: + ~991-byte
+  // bearer, i.e. a JWT/opaque token reaching this path, not a short admin key.)
+  const adminKeys = listAdminKeys(env)
+  if (adminKeys.includes(key)) {
+    return { id: "Admin", tier: "enterprise" }
+  }
+
+  // Diagnose oversize bearers without logging secrets.
+  const bearerBytes = utf8Len(key)
+  if (bearerBytes > 400) {
+    console.error(
+      `[getUser] long bearer: ${bearerBytes} bytes, ` +
+        `license:key would be ${utf8Len(`license:${key}`)} bytes, ` +
+        `startsWithEyJ=${key.startsWith("eyJ")}, parts=${key.split(".").length}`,
+    )
+  }
+
+  // ── 2. Trial tokens — ephemeral ──────────────────────────────────────
   if (key.startsWith("trial_")) {
     if (!env?.TRIAL_ENABLED || env.TRIAL_ENABLED !== "true") return null
-    const trial = await kv.get(`trial:${key}`, "json") as any
+    const trialKey = `trial:${key}`
+    if (!kvKeyOk(trialKey)) return null
+    const trial = await kvGetJson<any>(kv, trialKey)
     if (!trial) return null
-    if (now > trial.expiresAt) { await kv.delete(`trial:${key}`); return null }
+    if (now > trial.expiresAt) {
+      if (kvKeyOk(trialKey)) await kv.delete(trialKey)
+      return null
+    }
     return { id: `trial_${key.slice(6, 14)}`, tier: "pro" }
   }
 
-  // JWT tokens — verify signature, skip KV (JWT exceeds 512-byte KV key limit)
+  // ── 3. JWT — store only by short subject id, never by raw token ───────
   if (key.startsWith("eyJ") && key.split(".").length === 3) {
     const jwtUser = await verifySupabaseJWT(key)
     if (jwtUser) {
       let sbUser = licenseCache?.get("sb:" + jwtUser.sub)
       if (sbUser) return sbUser
-      const stored = await kv.get(`account:${jwtUser.sub}`, "json") as any
-      if (stored) { sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }; licenseCache?.set("sb:" + jwtUser.sub, sbUser); return sbUser }
+      const accountKey = `account:${jwtUser.sub}`
+      const stored = await kvGetJson<any>(kv, accountKey)
+      if (stored) {
+        sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }
+        licenseCache?.set("sb:" + jwtUser.sub, sbUser)
+        return sbUser
+      }
       sbUser = { id: jwtUser.sub, tier: "free" }
-      ctx.waitUntil(kv.put(`account:${jwtUser.sub}`, JSON.stringify({ username: jwtUser.email, tier: "free" })))
+      ctx.waitUntil(kvPutJson(kv, accountKey, { username: jwtUser.email, tier: "free" }).then(() => undefined))
       licenseCache?.set("sb:" + jwtUser.sub, sbUser)
       return sbUser
     }
+    // Invalid JWT — do not fall through into license:${jwt} (key too long).
     return null
   }
 
-  if (!licenseCache || now - licenseCacheTime > LICENSE_CACHE_TTL) { licenseCache = new Map(); licenseCacheTime = now }
+  // ── 4. Short license / account keys only ─────────────────────────────
+  // Opaque tokens that would make license:<token> exceed 512 bytes must never
+  // touch KV. 999-byte failures are exactly license: (8) + 991-byte bearer.
+  const licenseKvKey = `license:${key}`
+  if (!kvKeyOk(licenseKvKey)) {
+    console.error(
+      `[getUser] refusing license: KV for ${bearerBytes}-byte bearer ` +
+        `(license:key = ${utf8Len(licenseKvKey)} bytes). Not a short license key.`,
+    )
+    return null
+  }
+
+  if (!licenseCache || now - licenseCacheTime > LICENSE_CACHE_TTL) {
+    licenseCache = new Map()
+    licenseCacheTime = now
+  }
   let user = licenseCache.get(key)
   if (user) return user
-  const raw = await kv.get(`license:${key}`, "json") as any
-  if (raw) { licenseCache.set(key, raw); return raw }
-  // Check Workers Cache API — globally replicated, sub-10ms reads.
-  // Avoids KV eventual-consistency gap and license server cold starts.
+
+  const raw = await kvGetJson<any>(kv, licenseKvKey)
+  if (raw) {
+    // Normalize to {id, tier} — never promote raw blobs as user.id if missing.
+    const normalized = {
+      id: String(raw.id ?? raw.email ?? key.slice(0, 12)),
+      tier: String(raw.tier ?? "free"),
+    }
+    licenseCache.set(key, normalized)
+    return normalized
+  }
+  // Workers Cache API — globally replicated, sub-10ms reads.
   {
     const cache = caches.default
     const cacheUrl = `https://arcana-proxy/license/${encodeURIComponent(key)}`
     const cached = await cache.match(cacheUrl)
     if (cached) {
-      user = await cached.json() as { id: string; tier: string }
+      user = (await cached.json()) as { id: string; tier: string }
       licenseCache.set(key, user)
-      // Also backfill KV so it's available after cache expiry
-      ctx.waitUntil(kv.put(`license:${key}`, JSON.stringify(user)))
+      ctx.waitUntil(kvPutJson(kv, licenseKvKey, user).then(() => undefined))
       return user
     }
   }
-  // Configurable admin keys — enterprise tier. Accepts both singular
-  // (ARCANA_ADMIN_KEY) and plural (ARCANA_ADMIN_KEYS) env var names.
-  if (env?.ARCANA_ADMIN_KEYS || env?.ARCANA_ADMIN_KEY) {
-    const raw = (env.ARCANA_ADMIN_KEYS || env.ARCANA_ADMIN_KEY)!
-    const adminKeys = raw.split(",").map(k => k.trim()).filter(Boolean)
-    if (adminKeys.includes(key)) {
-      user = { id: "Admin", tier: "enterprise" }
+
+  const accountKvKey = `account:${key}`
+  if (kvKeyOk(accountKvKey)) {
+    const account = await kvGetJson<any>(kv, accountKvKey)
+    if (account) {
+      user = { id: account.username ?? account.email ?? "user", tier: "free" }
       licenseCache.set(key, user)
       return user
     }
   }
-  const account = await kv.get(`account:${key}`, "json") as any
-  if (account) { user = { id: account.username ?? account.email ?? "user", tier: "free" }; licenseCache.set(key, user); return user }
-  // Supabase JWT authentication
-  const jwtUser = await verifySupabaseJWT(key)
-  if (jwtUser) {
-    let sbUser = licenseCache?.get("sb:" + jwtUser.sub)
-    if (sbUser) return sbUser
-    const stored = await kv.get(`account:${jwtUser.sub}`, "json") as any
-    if (stored) { sbUser = { id: jwtUser.sub, tier: stored.tier || "free" }; licenseCache?.set("sb:" + jwtUser.sub, sbUser); return sbUser }
-    sbUser = { id: jwtUser.sub, tier: "free" }
-    ctx.waitUntil(kv.put(`account:${jwtUser.sub}`, JSON.stringify({ username: jwtUser.email, tier: "free" })))
-    licenseCache?.set("sb:" + jwtUser.sub, sbUser)
-    return sbUser
-  }
-  // Fallback: validate against license server (handles cross-KV namespace)
+
+  // Fallback: validate against license server (handles cross-KV namespace).
+  // Only for short keys (already gated by licenseKvKey length).
   try {
     const res = await fetch(`https://arcana-license-server.lejzerv.workers.dev/api/license/validate`, {
       method: "POST",
@@ -777,15 +857,12 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
     const data = body?.data ?? body
     if (data?.valid) {
       user = { id: key.slice(0, 12), tier: data.tier ?? "free" }
-      // Cache immediately so subsequent requests in this isolate are fast.
       licenseCache.set(key, user)
-      // KV for cross-region persistence (eventually consistent).
-      ctx.waitUntil(kv.put(`license:${key}`, JSON.stringify(user)))
-      // Cache API for instant global reads — bypasses KV inconsistency.
+      ctx.waitUntil(kvPutJson(kv, licenseKvKey, user).then(() => undefined))
       const cacheUrl = `https://arcana-proxy/license/${encodeURIComponent(key)}`
-      const res = new Response(JSON.stringify(user))
-      res.headers.set("Cache-Control", "max-age=86400")
-      ctx.waitUntil(caches.default.put(cacheUrl, res))
+      const cachedRes = new Response(JSON.stringify(user))
+      cachedRes.headers.set("Cache-Control", "max-age=86400")
+      ctx.waitUntil(caches.default.put(cacheUrl, cachedRes))
       return user
     }
   } catch {}
@@ -904,6 +981,22 @@ export default {
       if (url.pathname === "/v1/pay/sub-status") return handleSubStatus(request, env, corsHeaders)
       if (url.pathname === "/v1/trial/start") return handleTrialStart(request, env, corsHeaders)
 
+      // Admin endpoints — admin key only; never route through getUser/license KV
+      // (long admin secrets used to throw KV 414 before adminAuthorized ran).
+      if (url.pathname.startsWith("/v1/admin/")) {
+        if (!adminAuthorized(request, env)) return json({ error: "unauthorized" }, 401, corsHeaders)
+        if (url.pathname === "/v1/admin/providers") {
+          if (request.method === "GET") return handleAdminGetProviders(env, corsHeaders)
+          if (request.method === "PUT") return handleAdminSetProviders(request, env, ctx, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        }
+        if (url.pathname === "/v1/admin/licenses") {
+          if (request.method === "POST") return handleAdminMintLicense(request, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        }
+        return json({ error: "not_found" }, 404, corsHeaders)
+      }
+
       // Auth required
       const user = await getUser(request.headers.get("Authorization"), env.ARCANA_PROXY, ctx, env)
       if (!user) return json({ error: "unauthorized" }, 401, corsHeaders)
@@ -959,13 +1052,6 @@ export default {
           return handleSendTestReceipt(request, env, user, corsHeaders)
         case "/v1/auth/resolve-email":
           return handleResolveEmail(request, env, corsHeaders)
-        case "/v1/admin/providers":
-          if (request.method === "GET") return handleAdminGetProviders(env, corsHeaders)
-          if (request.method === "PUT") return handleAdminSetProviders(request, env, ctx, corsHeaders)
-          return json({ error: "method_not_allowed" }, 405, corsHeaders)
-        case "/v1/admin/licenses":
-          if (request.method === "POST") return handleAdminMintLicense(request, env, corsHeaders)
-          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/sessions":
           if (request.method === "GET") return handleGetSessions(request, user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
@@ -1941,12 +2027,10 @@ async function handleSubStatus(request: Request, env: Env, cors: Record<string, 
 
 // Admin endpoints for the provider priority list. Same gate as /v1/pay/setup-plans.
 function adminAuthorized(request: Request, env: Env): boolean {
-  const auth = request.headers.get("Authorization")
-  const adminKey = env.ARCANA_ADMIN_KEY
-  if (!adminKey) return false
-  if (auth === `Bearer ${adminKey}`) return true
-  const adminKeys = (env.ARCANA_ADMIN_KEYS ?? "").split(",").map(k => k.trim()).filter(Boolean)
-  return adminKeys.length > 0 && adminKeys.includes(auth?.replace(/^Bearer\s+/, "") ?? "")
+  const token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim() ?? ""
+  if (!token) return false
+  const keys = listAdminKeys(env)
+  return keys.length > 0 && keys.includes(token)
 }
 
 async function handleAdminGetProviders(env: Env, cors: Record<string, string>): Promise<Response> {
@@ -1994,6 +2078,8 @@ async function handleAdminSetProviders(request: Request, env: Env, ctx: Executio
 // is the same shape as PayPal-issued keys (ARCANA-PRO-...) and validates via
 // the standard license:<key> lookup in getUser().
 async function handleAdminMintLicense(request: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  // Caller already passed adminAuthorized when routed via /v1/admin/*; keep a
+  // defense-in-depth check for direct calls / tests.
   if (!adminAuthorized(request, env)) return json({ error: "unauthorized" }, 401, cors)
   const body = await request.json().catch(() => ({})) as any
   const supabaseUserId = String(body?.supabaseUserId ?? "").trim()
@@ -2003,19 +2089,24 @@ async function handleAdminMintLicense(request: Request, env: Env, cors: Record<s
   const plan = allowedPlans.has(planRaw) ? planRaw : "pro"
   if (!supabaseUserId || !email) return json({ error: "missing_fields", required: ["supabaseUserId", "email"] }, 400, cors)
 
-  const key = await generateLicenseKey()
+  const key = generateLicenseKey()
   const createdAt = Date.now()
+  const licenseKvKey = `license:${key}`
+  const emailKvKey = `email_account:${email}`
+  if (!kvKeyOk(licenseKvKey) || !kvKeyOk(emailKvKey)) {
+    return json({ error: "kv_key_too_long", message: "Generated license or email key exceeds KV limit" }, 500, cors)
+  }
   // No expiresAt — device-flow keys are open-ended. The reverse index is
   // mirrored from the PayPal path so /v1/identity/validate-email and other
   // email-lookup routes continue to work uniformly.
-  await env.ARCANA_PROXY.put(`license:${key}`, JSON.stringify({
+  await env.ARCANA_PROXY.put(licenseKvKey, JSON.stringify({
     id: email,
     tier: plan,
     supabaseUserId,
     source: "device_flow",
     createdAt,
   }))
-  await env.ARCANA_PROXY.put(`email_account:${email}`, JSON.stringify({
+  await env.ARCANA_PROXY.put(emailKvKey, JSON.stringify({
     licenseKey: key,
     tier: plan,
     source: "device_flow",
@@ -2321,8 +2412,9 @@ async function listModels(env: Env, cors: Record<string, string>): Promise<Respo
 
 async function getUserUsage(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   const date = new Date().toISOString().split("T")[0]!
-  const key = `usage:${user.id}:${date}`
-  const data = await env.ARCANA_PROXY.get(key, "json") as any ?? {}
+  const subject = utf8Len(user.id) > 80 ? (await sha256Hex(user.id)).slice(0, 40) : user.id
+  const key = `usage:${subject}:${date}`
+  const data = (kvKeyOk(key) ? await env.ARCANA_PROXY.get(key, "json") : null) as any ?? {}
   return json({ userId: user.id, date, ...data }, 200, cors)
 }
 
