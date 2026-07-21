@@ -631,7 +631,29 @@ function freeConversationId(request: Request, body: any): string {
     ?? body?.metadata?.arcana_session_id
     ?? body?.metadata?.session_id
     ?? body?.session_id
-    ?? "default"
+    ?? body?.user
+    ?? body?.metadata?.user_id
+    ?? hashConversationFallback(body)
+}
+
+/**
+ * Last-resort conversation key when no `x-arcana-session-id` header and no
+ * body field is present. Hashes a tiny stable projection of the request so
+ * the same (last-2 messages, model, toolset) tuple yields the same key
+ * (admit-on-retry works), while different conversations naturally hash
+ * to different keys. Replaces the old `?? "default"` fallback that made
+ * every client without a session header collide on the same `sessionKey`,
+ * causing cross-user `free_session_conversation_mismatch` rejections.
+ */
+async function hashConversationFallback(body: any): Promise<string> {
+  const projection = {
+    m: Array.isArray(body?.messages)
+      ? body.messages.slice(-2).map((m: any) => ({ r: m?.role, c: typeof m?.content === "string" ? m.content.slice(0, 200) : "" }))
+      : [],
+    model: body?.model ?? "",
+    tools: Array.isArray(body?.tools) ? body.tools.map((t: any) => t?.function?.name).filter(Boolean) : [],
+  }
+  return sha256Hex(JSON.stringify(projection))
 }
 
 
@@ -680,7 +702,7 @@ async function readFreeUsageRecord(userId: string, kv: KVNamespace): Promise<{ k
 async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace): Promise<FreeTurnAdmission> {
   const now = Date.now()
   const { key, record: stored } = await readFreeUsageRecord(user.id, kv)
-  const sessionKey = (await sha256Hex(`session:${freeConversationId(request, body)}`)).slice(0, 40)
+  const sessionKey = (await sha256Hex(`session:${await freeConversationId(request, body)}`)).slice(0, 40)
   const turnKey = (await sha256Hex(`turn:${freeTurnId(request, body)}`)).slice(0, 40)
   let record = stored && now < stored.resetAt ? stored : null
   if (!record) {
@@ -1255,6 +1277,7 @@ export default {
         case "/v1/usage":
           return getUserUsage(user, env, corsHeaders)
         case "/v1/free-usage/sessions/current":
+        case "/v1/free/usage":
           if (request.method === "GET") return getFreeUsageCurrent(user, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         case "/v1/free/models":
@@ -1394,7 +1417,15 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
       freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
       if (!freeAdmission.allowed) {
         await releaseLock()
-        return json({ error: freeAdmission.error, message: freeAdmission.message, freeUsage: freeAdmission.snapshot }, 429, responseHeaders())
+        const rejectCode: ArcanaErrorCode =
+          freeAdmission.error === "free_session_expired" ? "ARC_FREE_SESSION_EXPIRED"
+          : freeAdmission.error === "free_session_conversation_mismatch" ? "ARC_FREE_CONVERSATION_MISMATCH"
+          : freeAdmission.error === "free_turn_budget_reached" ? "ARC_FREE_TURN_BUDGET_REACHED"
+          : "ARC_FREE_EXHAUSTED"
+        return arcanaErrorResponse(429, freeAdmission.message || freeAdmission.error || "free exhausted", {
+          code: rejectCode,
+          cors: responseHeaders(),
+        })
       }
       body = clampFreeRequestBody(body)
     } else if (billableTier(user.tier)) {
@@ -1602,6 +1633,9 @@ type ArcanaErrorCode =
   | "ARC_IMAGE_FAILED"
   | "ARC_FREE_MODEL_ONLY"
   | "ARC_FREE_EXHAUSTED"
+  | "ARC_FREE_SESSION_EXPIRED"
+  | "ARC_FREE_CONVERSATION_MISMATCH"
+  | "ARC_FREE_TURN_BUDGET_REACHED"
   | "ARC_INTERNAL"
 
 const ARC_USER: Record<ArcanaErrorCode, { message: string; recovery: string[]; retryable: boolean }> = {
@@ -1688,12 +1722,36 @@ const ARC_USER: Record<ArcanaErrorCode, { message: string; recovery: string[]; r
     retryable: false,
   },
   ARC_FREE_EXHAUSTED: {
-    message: "Your free weekly session is used up (turns, time window, or token allowance).",
+    message: "Free-tier capacity check failed. Pick a free model or upgrade for more.",
     recovery: [
-      "Wait until free reset (see X-Arcana-Free-Reset-At)",
-      "Upgrade to Pro for more capacity",
+      "Use a free model (openrouter/free or any id ending in :free)",
+      "Upgrade to Pro for the full catalog",
     ],
     retryable: false,
+  },
+  ARC_FREE_SESSION_EXPIRED: {
+    message: "Your 60-minute free session has ended. Start a new one or upgrade for unlimited access.",
+    recovery: [
+      "Wait until next week's reset",
+      "Upgrade to Pro for unlimited sessions",
+    ],
+    retryable: false,
+  },
+  ARC_FREE_CONVERSATION_MISMATCH: {
+    message: "This free session is bound to a different conversation. Start a new chat to continue.",
+    recovery: [
+      "Open a new conversation",
+      "Upgrade to Pro for concurrent sessions",
+    ],
+    retryable: false,
+  },
+  ARC_FREE_TURN_BUDGET_REACHED: {
+    message: "This free turn couldn't reach a stable provider after 2 tries. Try again or pick a different model.",
+    recovery: [
+      "Retry",
+      "Switch to a free model that isn't saturated",
+    ],
+    retryable: true,
   },
   ARC_INTERNAL: {
     message: "Something went wrong inside Arcana.",
@@ -1724,7 +1782,7 @@ function classifyUpstream(status: number, bodyText: string): ArcanaErrorCode {
   if (msg.includes("context") && (msg.includes("exceed") || msg.includes("too long"))) return "ARC_CONTEXT_OVERFLOW"
   if (msg.includes("image_generation") || msg.includes("empty_image")) return "ARC_IMAGE_FAILED"
   if (msg.includes("all_providers_failed")) return "ARC_ALL_PROVIDERS_FAILED"
-  if (msg.includes("free") && (msg.includes("exhaust") || msg.includes("allowance") || msg.includes("weekly"))) {
+  if (msg.includes("free") && (msg.includes("exhaust") || msg.includes("allowance"))) {
     return "ARC_FREE_EXHAUSTED"
   }
   if (status >= 500 || status === 408 || status === 502 || status === 503 || status === 504) return "ARC_PROVIDER_UNAVAILABLE"
@@ -1764,7 +1822,7 @@ function arcanaErrorResponse(
       code,
       type:
         code.startsWith("ARC_AUTH") ? "auth"
-        : code.includes("QUOTA") || code.includes("CREDITS") || code === "ARC_PROVIDER_BALANCE" || code === "ARC_FREE_EXHAUSTED" ? "quota"
+        : code.includes("QUOTA") || code.includes("CREDITS") || code === "ARC_PROVIDER_BALANCE" || code === "ARC_FREE_EXHAUSTED" || code === "ARC_FREE_SESSION_EXPIRED" || code === "ARC_FREE_CONVERSATION_MISMATCH" || code === "ARC_FREE_TURN_BUDGET_REACHED" ? "quota"
         : code === "ARC_RATE_LIMITED" ? "rate_limit"
         : code.includes("MODEL") || code === "ARC_CONTEXT_OVERFLOW" || code === "ARC_FREE_MODEL_ONLY" ? "model"
         : code.includes("NETWORK") ? "network"
@@ -1897,8 +1955,16 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
       if (!freeAdmission.allowed) {
         await releaseLock()
+        // Map the three internal reject reasons to distinct user-facing codes
+        // so the TUI can show the actual cause (60-min expiry vs. cross-conversation
+        // vs. provider-cap hit) instead of the stale "weekly" generic.
+        const rejectCode: ArcanaErrorCode =
+          freeAdmission.error === "free_session_expired" ? "ARC_FREE_SESSION_EXPIRED"
+          : freeAdmission.error === "free_session_conversation_mismatch" ? "ARC_FREE_CONVERSATION_MISMATCH"
+          : freeAdmission.error === "free_turn_budget_reached" ? "ARC_FREE_TURN_BUDGET_REACHED"
+          : "ARC_FREE_EXHAUSTED"
         return arcanaErrorResponse(429, freeAdmission.message || freeAdmission.error || "free exhausted", {
-          code: "ARC_FREE_EXHAUSTED",
+          code: rejectCode,
           cors: responseHeaders(),
         })
       }
