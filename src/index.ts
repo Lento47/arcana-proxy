@@ -535,6 +535,8 @@ interface FreeTurnReservation {
 interface FreeUsageRecord {
   freeSessionId: string
   arcanaSessionKey: string
+  conversationId?: string            // raw conversation binding; aids recovery from legacy body-hash binding
+  stableId?: boolean                 // true when the binding came from a stable header/body id (not the body-hash fallback)
   activatedAt: number
   expiresAt: number
   resetAt: number
@@ -625,9 +627,37 @@ function freeTurnId(request: Request, body: any): string {
     ?? crypto.randomUUID()
 }
 
+/**
+ * Whether the request carries a stable, client-supplied conversation id.
+ * Used to distinguish header/body-derived ids from the unstable body-hash
+ * fallback so we can migrate free-usage records bound by the old fallback.
+ */
+function hasStableConversationId(request: Request, body: any): boolean {
+  return Boolean(
+    request.headers.get("x-arcana-session-id")
+      ?? request.headers.get("x-arcana-session")
+      ?? request.headers.get("x-session-affinity")
+      ?? request.headers.get("X-Session-Id")
+      ?? request.headers.get("x-session-id")
+      ?? body?.metadata?.arcana_session_id
+      ?? body?.metadata?.session_id
+      ?? body?.session_id
+      ?? body?.user
+      ?? body?.metadata?.user_id
+  )
+}
+
 function freeConversationId(request: Request, body: any): string {
   return request.headers.get("x-arcana-session-id")
     ?? request.headers.get("x-arcana-session")
+    // Engine sends X-Session-Id / x-session-affinity for providers whose
+    // providerID does not start with "arcana" (e.g. ihubmix models routed
+    // through arcana-proxy). Without these fallbacks the proxy falls through
+    // to the unstable body-hash fallback, which changes on every turn and
+    // produces false ARC_FREE_CONVERSATION_MISMATCH rejections.
+    ?? request.headers.get("x-session-affinity")
+    ?? request.headers.get("X-Session-Id")
+    ?? request.headers.get("x-session-id")
     ?? body?.metadata?.arcana_session_id
     ?? body?.metadata?.session_id
     ?? body?.session_id
@@ -702,13 +732,17 @@ async function readFreeUsageRecord(userId: string, kv: KVNamespace): Promise<{ k
 async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace): Promise<FreeTurnAdmission> {
   const now = Date.now()
   const { key, record: stored } = await readFreeUsageRecord(user.id, kv)
-  const sessionKey = (await sha256Hex(`session:${await freeConversationId(request, body)}`)).slice(0, 40)
+  const conversationId = await freeConversationId(request, body)
+  const stableId = hasStableConversationId(request, body)
+  const sessionKey = (await sha256Hex(`session:${conversationId}`)).slice(0, 40)
   const turnKey = (await sha256Hex(`turn:${freeTurnId(request, body)}`)).slice(0, 40)
   let record = stored && now < stored.resetAt ? stored : null
   if (!record) {
     record = {
       freeSessionId: `free_${crypto.randomUUID()}`,
       arcanaSessionKey: sessionKey,
+      conversationId,
+      stableId,
       activatedAt: now,
       expiresAt: now + FREE_SESSION_DURATION_MS,
       resetAt: now + FREE_SESSION_RESET_MS,
@@ -719,12 +753,29 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
   }
 
   if (record.arcanaSessionKey !== sessionKey) {
-    return {
-      allowed: false,
-      error: "free_session_conversation_mismatch",
-      message: "This free session is already bound to another Arcana conversation.",
-      snapshot: freeUsageSnapshot(record, now),
+    // Recovery: legacy records bound by the unstable body-hash fallback (or any
+    // pre-stable binding) can be re-bound once to a stable session id when the
+    // client starts sending one. This fixes the false ARC_FREE_CONVERSATION_MISMATCH
+    // loop for users whose sessions were captured by the body-hash fallback before
+    // the proxy learned to read X-Session-Id / x-session-affinity.
+    if (!record.stableId && stableId) {
+      record.arcanaSessionKey = sessionKey
+      record.conversationId = conversationId
+      record.stableId = true
+    } else {
+      return {
+        allowed: false,
+        error: "free_session_conversation_mismatch",
+        message: "This free session is already bound to another Arcana conversation.",
+        snapshot: freeUsageSnapshot(record, now),
+      }
     }
+  }
+
+  // Promote a legacy record to stable binding if the request now has a stable id.
+  if (!record.stableId && stableId) {
+    record.conversationId = conversationId
+    record.stableId = true
   }
 
   const existing = record.reservations[turnKey]
