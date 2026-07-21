@@ -2773,7 +2773,7 @@ async function handleAdminMintLicense(request: Request, env: Env, cors: Record<s
   const supabaseUserId = String(body?.supabaseUserId ?? "").trim()
   const email = String(body?.email ?? "").trim().toLowerCase()
   const planRaw = String(body?.plan ?? "pro").trim().toLowerCase()
-  const allowedPlans = new Set(["pro", "team", "enterprise"])
+  const allowedPlans = new Set(["free", "pro", "team", "enterprise"])
   const plan = allowedPlans.has(planRaw) ? planRaw : "pro"
   if (!supabaseUserId || !email) return json({ error: "missing_fields", required: ["supabaseUserId", "email"] }, 400, cors)
 
