@@ -54,20 +54,29 @@ export const FREE_MODEL_SEED = [
 
 export const FREE_MODEL_DEFAULT = "openrouter/free"
 
-/** Hard weekly free product caps (unchanged product economics) */
-export const FREE_SESSION_TURN_LIMIT = 10
-export const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
+/**
+ * Free product caps. Product intent (2026-07): a free session is one 60-minute
+ * window of effectively unlimited use. The 10-turn counter is a SOFT display
+ * threshold — it does not hard-block; the only hard stop is the 60-minute
+ * session window, after which the weekly (7-day) reset locks the subject out
+ * until resetAt. Token caps are unlimited (set high enough to never bind); the
+ * server stops tracking them as a gate. Rate limits (FREE_IP/USER/GLOBAL) still
+ * pace burst abuse; they do not cap total session usage.
+ */
+export const FREE_SESSION_TURN_LIMIT = 10          // soft display threshold only — no hard reject
+export const FREE_SESSION_DURATION_MS = 60 * 60 * 1000   // HARD stop: the only real cap
 export const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-export const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000
+export const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only
 
 /**
- * Progressive wire budgets — quality first, expand only when healthy.
- * Even "expanded" stays far below 1M; long models are for SELECT/map, not dump.
+ * Progressive wire budgets. With unlimited tokens, all tiers are set to a
+ * high ceiling so clampBodyToBudget never truncates free traffic. The tier
+ * label is still reported (X-Arcana-Free-Budget-Tier) for observability.
  */
 export const FREE_BUDGET = {
-  lean: { maxInputTokens: 6_144, maxOutputTokens: 1_536 },
-  standard: { maxInputTokens: 10_240, maxOutputTokens: 2_048 },
-  expanded: { maxInputTokens: 14_336, maxOutputTokens: 2_048 },
+  lean: { maxInputTokens: 1_000_000, maxOutputTokens: 1_000_000 },
+  standard: { maxInputTokens: 1_000_000, maxOutputTokens: 1_000_000 },
+  expanded: { maxInputTokens: 1_000_000, maxOutputTokens: 1_000_000 },
 } as const
 
 /** Absolute ceiling (never exceed even on expanded) */
