@@ -3289,7 +3289,14 @@ async function handleGetSessions(request: Request, user: { id: string }, env: En
 async function handleGetSessionDetail(sessionId: string, user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   const session = await env.ARCANA_PROXY.get(`session:${sessionId}`, "json") as any
   if (!session) return json({ error: "not_found" }, 404, cors)
-  if (session.userId !== user.id) return json({ error: "forbidden" }, 403, cors)
+  // The CLI writes sessions with its own userId (supabaseUserId for device-flow,
+  // Arcana account id for legacy). The web workspace sends a Supabase JWT whose
+  // sub is the same Supabase user but lives under a different key. Allow any
+  // linked subject to read — mirrors handleGetSessions / handleGetMemory.
+  const subjects = await resolveDataSubjects(user.id, env)
+  if (!subjects.includes(String(session.userId ?? ""))) {
+    return json({ error: "forbidden" }, 403, cors)
+  }
   return json(session, 200, cors)
 }
 
