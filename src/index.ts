@@ -1522,6 +1522,25 @@ function extractUsage(responseText: string, model: string): { inputTokens: numbe
 }
 
 /**
+ * Pull the actual model the upstream served from an SSE stream. Meta-routers
+ * like openrouter/free (and openrouter/auto) accept a router slug but report
+ * the real chosen model in every chunk's `model` field. Recording that — not
+ * the slug — keeps the web-app session list honest about which model answered.
+ */
+function extractStreamModel(responseText: string): string | null {
+  try {
+    for (const l of responseText.split("\n")) {
+      if (!l.startsWith("data: ")) continue
+      const payload = l.slice(6)
+      if (payload === "[DONE]") continue
+      const parsed = JSON.parse(payload)
+      if (parsed.model) return String(parsed.model)
+    }
+  } catch {}
+  return null
+}
+
+/**
  * Strip OpenAI Responses / Azure-only knobs that break plain /v1/chat/completions.
  * Aihubmix (often Azure-backed) returns 400 "The requested operation is unsupported"
  * when these leak through from the Responses SDK path.
@@ -2120,13 +2139,18 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
         } finally {
           await writer.close()
           const usage = extractUsage(fullResponse, resolved.model)
-          if (usage) {
-            adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
-            const sc = (usage.totalCost ?? estimateCost(resolved.model, usage.inputTokens, usage.outputTokens)) * margin * 100
-            ctx.waitUntil(recordSession(user, resolved.model, provider, usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
-            ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
-          }
-          else if (streamFailed && !failoverTriggered && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
+          const uIn = usage?.inputTokens ?? 0
+          const uOut = usage?.outputTokens ?? 0
+          if (usage) adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
+          // Record every completed/failed turn, even when the upstream reports
+          // no usage (openrouter/free meta-router often omits it). Otherwise the
+          // turn is invisible in the web app's session list. Record the actual
+          // served model (extractStreamModel), not the router slug.
+          const servedModel = extractStreamModel(fullResponse) ?? (user.tier === "free" ? upstreamModel : resolved.model)
+          const sc = (usage?.totalCost ?? estimateCost(resolved.model, uIn, uOut)) * margin * 100
+          ctx.waitUntil(recordSession(user, servedModel, provider, uIn, uOut, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
+          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : uIn, streamFailed ? 0 : uOut))
+          if (!usage && streamFailed && !failoverTriggered && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
           if (streamFailed && !failoverTriggered) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
           await releaseLock()
         }
@@ -2137,19 +2161,17 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     }
 
     const data = await response.json() as any
-    if (data.usage) {
-      const tokensIn = data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0
-      const tokensOut = data.usage.completion_tokens ?? data.usage.output_tokens ?? 0
-      const upstreamCost = data.usage.total_cost
-      await adjustBalance(tokensIn, tokensOut, upstreamCost)
-      const sc = (upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)) * margin * 100
-      ctx.waitUntil(recordSession(user, resolved.model, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
-    }
-    // When data.usage is absent (some upstreams don't report it), we don't accumulate tokens;
-    // the per-turn input cap and the 10-turn limit are still in force.
-    const settledIn = data?.usage ? (data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0) : 0
-    const settledOut = data?.usage ? (data.usage.completion_tokens ?? data.usage.output_tokens ?? 0) : 0
-    ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, settledIn, settledOut))
+    const tokensIn = data?.usage?.prompt_tokens ?? data?.usage?.input_tokens ?? 0
+    const tokensOut = data?.usage?.completion_tokens ?? data?.usage?.output_tokens ?? 0
+    const upstreamCost = data?.usage?.total_cost
+    if (data?.usage) await adjustBalance(tokensIn, tokensOut, upstreamCost)
+    // Record every turn even when usage is absent (openrouter/free omits it);
+    // 0 tokens is honest and keeps the turn visible in the web app. Use the
+    // actual served model (data.model), not the router slug.
+    const servedModel = (data?.model as string) ?? (user.tier === "free" ? upstreamModel : resolved.model)
+    const sc = (upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)) * margin * 100
+    ctx.waitUntil(recordSession(user, servedModel, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut))
     await releaseLock()
     const successHeaders: Record<string, string> = { ...responseHeaders(), "X-Provider": provider }
     if (user.tier === "free") {
