@@ -1860,7 +1860,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   const responseHeaders = () => {
     const h = { ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) }
     if (freeModelRemap) {
-      h["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}→${freeModelRemap.to}`
+      h["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}->${freeModelRemap.to}`
       h["X-Arcana-Free-Model"] = freeModelRemap.to
     }
     if (freeBudget) {
@@ -2154,7 +2154,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     const successHeaders: Record<string, string> = { ...responseHeaders(), "X-Provider": provider }
     if (user.tier === "free") {
       successHeaders["X-Arcana-Free-Model"] = upstreamModel
-      if (freeModelRemap) successHeaders["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}→${upstreamModel}`
+      if (freeModelRemap) successHeaders["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}->${upstreamModel}`
     }
     return json(data, response.status, successHeaders)
   } // end provider loop
