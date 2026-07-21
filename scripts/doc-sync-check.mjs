@@ -117,14 +117,15 @@ console.log("\nFree-tier constants:")
 for (const c of constants) check(`constant "${c}"`, "src/index.ts", c)
 
 // --- Rejection codes claimed in the rejection table ---
+// free_turn_limit_reached and free_weekly_token_limit_reached were retired:
+// turns are now a soft display threshold and tokens are unlimited. The only
+// remaining terminal reject is free_session_expired (the 60-minute window).
 const rejectionCodes = [
-  "free_turn_limit_reached",
   "free_session_expired",
   "free_session_conversation_mismatch",
   "free_turn_budget_reached",
-  "free_weekly_token_limit_reached",
 ]
-console.log("\nFree-tier rejection codes (free_weekly_cooldown is documented in the spec but NOT emitted by the proxy; intentionally not in this list):")
+console.log("\nFree-tier rejection codes (free_turn_limit_reached / free_weekly_token_limit_reached retired — turns soft, tokens unlimited; free_weekly_cooldown never emitted):")
 for (const c of rejectionCodes) check(`rejection code "${c}"`, "src/index.ts", c)
 
 // --- Response headers claimed in the headers table ---

@@ -45,14 +45,12 @@ interface FreeUsageRecordDO {
 
 // Mirror the constants from src/index.ts. Kept in sync via the doc-sync check.
 // DO NOT change without updating both files.
-const FREE_SESSION_TURN_LIMIT = 10
-const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
+const FREE_SESSION_TURN_LIMIT = 10          // soft display threshold only — no hard reject
+const FREE_SESSION_DURATION_MS = 60 * 60 * 1000   // HARD stop: the only real cap
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
 const FREE_TURN_PROVIDER_CALL_LIMIT = 2
-const FREE_MAX_INPUT_TOKENS = 16_384
-const FREE_MAX_OUTPUT_TOKENS = 2_048
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2
-const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000
+const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only
 
 type FreeUsageState = "eligible" | "active" | "exhausted" | "expired"
 
@@ -208,27 +206,12 @@ export class FreeUsageDO {
       return { allowed: true, recordKey: "do", turnKey: req.turnKey, snapshot: snapshot(record, now) }
     }
 
-    // 3. weekly aggregate cap (the cheap pre-flight)
-    if (record.tokensUsed + req.inputTokens > FREE_WEEKLY_TOKEN_AGGREGATE) {
-      return {
-        allowed: false,
-        error: "free_weekly_token_limit_reached",
-        message: `This free week's token allowance is used up. Weekly limit: ${FREE_WEEKLY_TOKEN_AGGREGATE.toLocaleString("en")} combined in+out tokens. Resets at ${new Date(record.resetAt).toISOString()}.`,
-        snapshot: snapshot(record, now),
-      }
-    }
-
-    // 4. per-turn input cap
-    if (req.inputTokens > FREE_MAX_INPUT_TOKENS) {
-      return {
-        allowed: false,
-        error: "free_turn_budget_reached",
-        message: `Free turns are limited to about ${FREE_MAX_INPUT_TOKENS.toLocaleString("en")} input tokens. Output is capped at ${FREE_MAX_OUTPUT_TOKENS.toLocaleString("en")} tokens.`,
-        snapshot: snapshot(record, now),
-      }
-    }
-
-    // 5. session expired
+    // The 60-minute session window is the ONLY hard cap. Turns are a soft
+    // display threshold (counted for the snapshot, never rejected) and tokens
+    // are unlimited — so no weekly-aggregate, per-turn-input, weekly-cooldown,
+    // or turn-limit rejections here. Session expiry is the sole terminal
+    // reject; the persisted record (until resetAt) keeps the subject locked
+    // out for the weekly window after their hour ends.
     if (now >= record.expiresAt) {
       return {
         allowed: false,
@@ -238,30 +221,7 @@ export class FreeUsageDO {
       }
     }
 
-    // 6. NEW: weekly cooldown — emits free_weekly_cooldown per the spec.
-    //    Under KV, this branch was unreachable (the read returned null and a
-    //    new record was created, ignoring the cooldown). Under the DO, we can
-    //    see the prior record's resetAt and reject explicitly.
-    if (now < record.resetAt && record.turnsUsed >= FREE_SESSION_TURN_LIMIT) {
-      return {
-        allowed: false,
-        error: "free_weekly_cooldown",
-        message: `Weekly reset in effect. Resets at ${new Date(record.resetAt).toISOString()}.`,
-        snapshot: snapshot(record, now),
-      }
-    }
-
-    // 7. turns exhausted (10-turn cap hit; this is the in-window case)
-    if (record.turnsUsed >= FREE_SESSION_TURN_LIMIT) {
-      return {
-        allowed: false,
-        error: "free_turn_limit_reached",
-        message: "The free session has used all 10 turns.",
-        snapshot: snapshot(record, now),
-      }
-    }
-
-    // 8. admit
+    // admit
     record.turnsUsed++
     reservations[req.turnKey] = { admittedAt: now, providerCalls: 1, status: "admitted" }
     record.reservations = JSON.stringify(reservations)
@@ -279,7 +239,8 @@ export class FreeUsageDO {
     turn.settledAt = req.now
     if (req.status === "completed") {
       const delta = Math.max(0, req.tokensIn) + Math.max(0, req.tokensOut)
-      record.tokensUsed = Math.min(FREE_WEEKLY_TOKEN_AGGREGATE, record.tokensUsed + delta)
+      // Tokens are unlimited; accumulate for display only (no cap, no clamp).
+      record.tokensUsed = record.tokensUsed + delta
     }
     record.reservations = JSON.stringify(reservations)
     this.writeRecord(record)
@@ -318,12 +279,9 @@ function snapshot(record: FreeUsageRecordDO | null, now: number = Date.now()): F
       tokensRemaining: FREE_WEEKLY_TOKEN_AGGREGATE,
     }
   }
-  const state: FreeUsageState =
-    record.turnsUsed >= FREE_SESSION_TURN_LIMIT || record.tokensUsed >= FREE_WEEKLY_TOKEN_AGGREGATE
-      ? "exhausted"
-      : now >= record.expiresAt
-        ? "expired"
-        : "active"
+  // Turns are a soft display threshold (never "exhausted"); the only hard
+  // terminal state is the 60-minute session expiry. Tokens are unlimited.
+  const state: FreeUsageState = now >= record.expiresAt ? "expired" : "active"
   return {
     state,
     freeSessionId: record.freeSessionId,

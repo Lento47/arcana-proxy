@@ -220,21 +220,29 @@ Free users (`tier === "free"`) are subject to the following limits. The spec liv
 
 | Limit | Value | Where it lives | Rejection code |
 | --- | --- | --- | --- |
-| Sessions per reset period | 1 | `FREE_SESSION_RESET_MS` (7 days, anchored to `activated_at`) | _not enforced_ (see note above) |
-| Session duration | 60 minutes | `FREE_SESSION_DURATION_MS` | `free_session_expired` |
-| Turn allowance | 10 turns | `FREE_SESSION_TURN_LIMIT` | `free_turn_limit_reached` |
-| Per-turn input cap | 16,384 raw input tokens | `FREE_MAX_INPUT_TOKENS` | `free_turn_budget_reached` |
-| Per-turn output cap | 2,048 output tokens | `FREE_MAX_OUTPUT_TOKENS` (clamped via `clampFreeRequestBody`) | — (silent) |
+| Sessions per reset period | 1 | `FREE_SESSION_RESET_MS` (7 days, anchored to `activated_at`) | `free_session_expired` (after the hour, until `resetAt`) |
+| Session duration | **60 minutes — the only HARD stop** | `FREE_SESSION_DURATION_MS` | `free_session_expired` |
+| Turn allowance | 10 turns (**SOFT** — display only, never hard-blocks) | `FREE_SESSION_TURN_LIMIT` | — (none; soft threshold) |
+| Per-turn input cap | unlimited (1,000,000 ceiling — never binds) | `FREE_MAX_INPUT_TOKENS` | — (retired) |
+| Per-turn output cap | unlimited (1,000,000 ceiling — never binds) | `FREE_MAX_OUTPUT_TOKENS` | — (retired) |
 | Per-turn provider calls | 2 (original + one failover on hard 5xx/429) | `FREE_TURN_PROVIDER_CALL_LIMIT` | `free_turn_budget_reached` |
 | Per-provider failover attempts | 2 (only when not forced via prefix) | `FREE_PROVIDER_ATTEMPT_LIMIT` | — |
-| Burst limit (IP) | 20 req/min | `FREE_IP_RATE_LIMIT` | `rate_limited` |
+| Burst limit (IP) | 15 req/min | `FREE_IP_RATE_LIMIT` | `rate_limited` |
 | Burst limit (user) | 8 req/min | `FREE_USER_RATE_LIMIT` | `rate_limited` |
-| Weekly token aggregate | 200,000 combined in+out tokens per subject-key | `FREE_WEEKLY_TOKEN_AGGREGATE` | `free_weekly_token_limit_reached` |
+| Weekly token aggregate | unlimited (1,000,000,000 display ceiling — never binds) | `FREE_WEEKLY_TOKEN_AGGREGATE` | — (retired) |
+| Daily request limit | unlimited | `DAILY_LIMITS.free` (`Infinity`) | — |
+
+**Product intent (2026-07):** a free session is one 60-minute window of effectively unlimited
+use. The 10-turn counter is a **soft** display threshold — the proxy still counts and reports it
+(`X-Arcana-Free-Used` / `X-Arcana-Free-Remaining`) but never rejects on it. Token caps (per-turn
+and weekly) and the daily request count are unlimited. The only hard terminal reject is
+`free_session_expired` when the 60-minute window ends; the record then persists until `resetAt`
+(7 days), which is what enforces the weekly cooldown. Burst rate limits (IP/user/global) still
+pace request frequency to protect the free pool — they do not cap total session usage.
 
 The weekly reset anchor is `activated_at` (the timestamp of the first admitted free turn), not
-`resetAt` of the prior record. Exhausting turns early does not move the reset forward. The
-`tokensUsed` counter is updated only on `completed` turn settlements — a failed turn does not
-drain the weekly allowance.
+`resetAt` of the prior record. The `tokensUsed` counter is updated only on `completed` turn
+settlements and is kept purely for display (no cap, no clamp).
 
 ### Free-usage response headers
 
@@ -244,15 +252,15 @@ to surface):
 
 | Header | Meaning |
 | --- | --- |
-| `X-Arcana-Free-State` | One of `eligible`, `active`, `exhausted`, `expired` |
-| `X-Arcana-Free-Used` | Turns used in the current weekly session |
-| `X-Arcana-Free-Remaining` | Turns remaining (`max(0, 10 - used)`) |
-| `X-Arcana-Free-Limit` | Total turns per session (10) |
-| `X-Arcana-Free-Expires-At` | ISO 8601; when the 1-hour active window ends |
+| `X-Arcana-Free-State` | One of `eligible`, `active`, `expired` (`exhausted` is no longer produced — turns are soft) |
+| `X-Arcana-Free-Used` | Turns used in the current weekly session (soft counter) |
+| `X-Arcana-Free-Remaining` | Turns remaining (`max(0, 10 - used)`); hits 0 at the soft threshold but does not block |
+| `X-Arcana-Free-Limit` | Soft turn threshold (10) |
+| `X-Arcana-Free-Expires-At` | ISO 8601; when the 1-hour active window ends (the hard stop) |
 | `X-Arcana-Free-Reset-At` | ISO 8601; when the 7-day reset fires |
-| `X-Arcana-Free-Tokens-Used` | Combined in+out tokens settled across this weekly record |
-| `X-Arcana-Free-Tokens-Limit` | 200,000 |
-| `X-Arcana-Free-Tokens-Remaining` | `max(0, 200000 - tokensUsed)` |
+| `X-Arcana-Free-Tokens-Used` | Combined in+out tokens settled across this weekly record (display only) |
+| `X-Arcana-Free-Tokens-Limit` | 1,000,000,000 (display ceiling; effectively unlimited) |
+| `X-Arcana-Free-Tokens-Remaining` | `max(0, 1_000_000_000 - tokensUsed)` (effectively unlimited) |
 
 **Note on token count freshness:** the token counters in the response headers reflect the
 *pre-turn* snapshot from `reserveFreeTurn`. The `settleFreeTurn` that increments `tokensUsed`
@@ -269,19 +277,15 @@ headers, plus `used` and `remaining` integer fields).
 
 | Code | Meaning |
 | --- | --- |
-| `free_turn_limit_reached` | All ten turns were admitted. |
-| `free_session_expired` | The one-hour active window ended. |
+| `free_session_expired` | The one-hour active window ended (the only hard terminal reject). Until `resetAt` (7 days) the record persists, so this also serves as the weekly-cooldown reject. |
 | `free_session_conversation_mismatch` | Another conversation tried to use the active allowance. |
-| `free_turn_budget_reached` | One turn exceeded its per-turn provider-call, input, or output ceiling. |
-| `free_weekly_token_limit_reached` | The user's weekly combined in+out token allowance is used up. |
+| `free_turn_budget_reached` | One turn exceeded its per-turn provider-call ceiling (2 dispatches). |
 
-> **Note on `free_weekly_cooldown`:** the spec documents this code for the case where a free user
-> in their 7-day cooldown window is admitted by the proxy (the proxy sees no record and acts as
-> if they are eligible). The proxy **does not** emit this code today — it has no way to detect
-> the cooldown state without a Durable Object. This is a known gap that the DO migration will
-> close. Until then, a free user who somehow gets through (e.g. by hitting a different turn-id
-> for a previously-exhausted conversation) will be admitted but immediately re-`exhausted` on
-> the very next turn. UX impact: minor. Security impact: none.
+> **Retired codes:** `free_turn_limit_reached` and `free_weekly_token_limit_reached` are no longer
+> emitted. Turns are a soft display threshold (counted, never rejected) and tokens are unlimited
+> (per-turn and weekly). `free_weekly_cooldown` was never emitted by the proxy and is not emitted
+> now either — the weekly cooldown is enforced by the persisted expired record returning
+> `free_session_expired` until `resetAt`.
 
 The free-tier spec calls for these errors to be treated as **terminal** on the client side — no
 automatic retry. The `Retry-After` header is **not currently set** by the proxy for any of these

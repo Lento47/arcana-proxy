@@ -488,7 +488,7 @@ const RATE_WINDOW = 60000
 
 // Daily usage limits by tier
 const DAILY_LIMITS: Record<string, number> = {
-  free: 50,
+  free: Infinity,    // free session is bounded by the 60-min window + weekly reset, not a daily request count
   trial: 200,
   pro: 2000,
   team: 5000,
@@ -518,7 +518,7 @@ const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
 const FREE_TURN_PROVIDER_CALL_LIMIT = 2     // 2 provider dispatches per turn-id: original + one failover attempt on hard 5xx/429
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // free tier: openrouter only (never aihubmix paid routes)
-const FREE_WEEKLY_TOKEN_AGGREGATE = 200_000    // per-subject-key combined in+out cap; reset anchored to activated_at + 7d
+const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only — the 60-min session is the real cap
 
 // Free model routing lives in ./free-routing.ts (quality ranking, progressive budgets, pools)
 
@@ -582,13 +582,9 @@ function freeUsageTtl(record: FreeUsageRecord, now = Date.now()): number {
 
 function freeUsageSnapshot(record: FreeUsageRecord | null, now = Date.now()): FreeUsageSnapshot {
   if (!record || now >= record.resetAt) return { state: "eligible", used: 0, remaining: FREE_SESSION_TURN_LIMIT, limit: FREE_SESSION_TURN_LIMIT, tokensUsed: 0, tokensLimit: FREE_WEEKLY_TOKEN_AGGREGATE, tokensRemaining: FREE_WEEKLY_TOKEN_AGGREGATE }
-  const state: FreeUsageState = record.turnsUsed >= FREE_SESSION_TURN_LIMIT
-    ? "exhausted"
-    : record.tokensUsed >= FREE_WEEKLY_TOKEN_AGGREGATE
-      ? "exhausted"
-      : now >= record.expiresAt
-        ? "expired"
-        : "active"
+  // Turns are a SOFT display threshold (never "exhausted"); the only hard
+  // terminal state is the 60-minute session expiry. Tokens are unlimited.
+  const state: FreeUsageState = now >= record.expiresAt ? "expired" : "active"
   return {
     state,
     freeSessionId: record.freeSessionId,
@@ -724,37 +720,15 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
     return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now) }
   }
 
-  // Weekly aggregate: reject up front if admitting this turn would obviously push tokens over the cap.
-  // (provider-call token accounting happens at settle, so this is a cheap guard against the worst case.)
-  if (record.tokensUsed + inputTokens > FREE_WEEKLY_TOKEN_AGGREGATE) {
-    return {
-      allowed: false,
-      error: "free_weekly_token_limit_reached",
-      message: `This free week's token allowance is used up. Weekly limit: ${FREE_WEEKLY_TOKEN_AGGREGATE.toLocaleString("en")} combined in+out tokens. Resets at ${new Date(record.resetAt).toISOString()}.`,
-      snapshot: freeUsageSnapshot(record, now),
-    }
-  }
-  if (inputTokens > FREE_MAX_INPUT_TOKENS) {
-    return {
-      allowed: false,
-      error: "free_turn_budget_reached",
-      message: `Free turns are limited to about ${FREE_MAX_INPUT_TOKENS.toLocaleString("en")} input tokens. Output is capped at ${FREE_MAX_OUTPUT_TOKENS.toLocaleString("en")} tokens.`,
-      snapshot: freeUsageSnapshot(record, now),
-    }
-  }
+  // The 60-minute session window is the ONLY hard cap. Turns are a soft display
+  // threshold (we still count them for X-Arcana-Free-Used/Remaining, but never
+  // reject on them), and tokens are unlimited — so no weekly-aggregate or
+  // per-turn-input rejections here. Session expiry is the sole terminal reject.
   if (now >= record.expiresAt) {
     return {
       allowed: false,
       error: "free_session_expired",
       message: "The one-hour free session has ended.",
-      snapshot: freeUsageSnapshot(record, now),
-    }
-  }
-  if (record.turnsUsed >= FREE_SESSION_TURN_LIMIT) {
-    return {
-      allowed: false,
-      error: "free_turn_limit_reached",
-      message: "The free session has used all 10 turns.",
       snapshot: freeUsageSnapshot(record, now),
     }
   }
@@ -777,8 +751,8 @@ async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: 
   // and we don't want a flaky upstream to silently drain the free allowance.
   if (status === "completed") {
     const delta = Math.max(0, tokensIn) + Math.max(0, tokensOut)
-    // Hard clamp to the weekly cap — last-write-wins, KV is eventually consistent.
-    record.tokensUsed = Math.min(FREE_WEEKLY_TOKEN_AGGREGATE, record.tokensUsed + delta)
+    // Tokens are unlimited; accumulate for display only (no cap, no clamp).
+    record.tokensUsed = record.tokensUsed + delta
   }
   await kv.put(admission.recordKey, JSON.stringify(record), { expirationTtl: freeUsageTtl(record) })
 }
