@@ -153,8 +153,14 @@ export function scoreModel(m: ClassifiedModel): number {
   if (/nano|tiny|1b|2b|3b|4b|7b|8b|9b|embed|safety|tts|whisper|image|video/.test(id)) s -= 6
   if (/embed|rerank|moderation|whisper|tts|image|video|lyria/.test(id)) s -= 30
 
-  // Prefer meta free router as resilient default, not highest quality
-  if (id === "openrouter/free") s += 15
+  // Prefer meta free router as resilient default, not highest quality.
+  // Boost dominates any single free model (e.g. nvidia/nemotron-3-ultra-550b
+  // scores ~64) so openrouter/free tops the pool and is the first free→free
+  // failover candidate. OpenRouter's meta router auto-picks an available free
+  // model, so it returns content where giant free shells (550b nemotron) often
+  // return 200-empty when overloaded — which previously caused client retry
+  // storms that tripped ARC_RATE_LIMIT.
+  if (id === "openrouter/free") s += 50
 
   return Math.max(0, Math.min(100, s))
 }
