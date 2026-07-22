@@ -648,7 +648,13 @@ function hasStableConversationId(request: Request, body: any): boolean {
 }
 
 function freeConversationId(request: Request, body: any): string {
-  return request.headers.get("x-arcana-session-id")
+  // Project-stable conversation identifier — sent by the engine as
+  // x-arcana-conversation. Check BEFORE session headers so all sessions
+  // in the same project share one conversation identity per 60-min window.
+  // Without this, each arcana run (new session) produces a different
+  // sessionKey and triggers ARC_FREE_CONVERSATION_MISMATCH.
+  return request.headers.get("x-arcana-conversation")
+    ?? request.headers.get("x-arcana-session-id")
     ?? request.headers.get("x-arcana-session")
     // Engine sends X-Session-Id / x-session-affinity for providers whose
     // providerID does not start with "arcana" (e.g. ihubmix models routed
