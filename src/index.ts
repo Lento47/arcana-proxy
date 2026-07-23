@@ -508,7 +508,7 @@ interface SendEmail {
 // requests than block a single real one.
 
 const BURST_MULTIPLIER = 3        // max burst = 3× the per-minute limit
-const BIAS_MULTIPLIER = 1.5       // single-user effective limit headroom
+const BIAS_MULTIPLIER = 3         // single-user effective limit headroom (tripled for agentic concurrency)
 
 interface TokenBucket {
   tokens: number     // current token count (fractional, continuous refill)
