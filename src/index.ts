@@ -33,6 +33,15 @@ import {
   type LoadFactorConfig,
 } from "./free-routing"
 
+import {
+  FREE_SESSION_TURN_LIMIT,
+  FREE_SESSION_DURATION_MS,
+  FREE_SESSION_RESET_MS,
+  FREE_WEEKLY_TOKEN_AGGREGATE,
+  FREE_TURN_MAX_DURATION_MS,
+  FREE_DAILY_LIMIT,
+} from "./free-config"
+
 const OPENROUTER_URL = "https://openrouter.ai/api"
 const AIHUBMIX_URL = "https://aihubmix.com"
 const AIHUBMIX_FALLBACK_URL = "https://api.inferera.com"
@@ -554,7 +563,7 @@ function checkRateLimit(
 
 // Daily usage limits by tier
 const DAILY_LIMITS: Record<string, number> = {
-  free: Infinity,    // free session is bounded by the 60-min window + weekly reset, not a daily request count
+  free: FREE_DAILY_LIMIT,
   trial: 200,
   pro: 2000,
   team: 5000,
@@ -579,14 +588,9 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
   return { allowed: true, remaining }
 }
 
-const FREE_SESSION_TURN_LIMIT = 10
-const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
-const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
 const FREE_TURN_PROVIDER_CALL_LIMIT = 25    // 25 provider dispatches per turn-id: combined with the 20-model failover list, tries ~500 upstream combos before giving up on a saturated free pool
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // free tier: openrouter only (never aihubmix paid routes)
-const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only — the 60-min session is the real cap
 const FREE_MODEL_FAILOVER_BACKOFF_MS = 300     // pause between cycling to the next free model candidate so saturated models cycle faster
-const FREE_TURN_MAX_DURATION_MS = 60_000      // 60-second time budget per turn (was 30s): proxy has more runway to find a working free model
 const FREE_CLOUDFLARE_FALLBACK_MODELS = [
   "@cf/meta/llama-3.2-3b-instruct",        // fast & cheap
   "@cf/mistral/mistral-7b-instruct-v0.3",   // reliable workhorse
@@ -729,6 +733,23 @@ function freeUsageHeaders(snapshot?: FreeUsageSnapshot): Record<string, string> 
   if (snapshot.expiresAt) headers["X-Arcana-Free-Expires-At"] = snapshot.expiresAt
   if (snapshot.resetAt) headers["X-Arcana-Free-Reset-At"] = snapshot.resetAt
   return headers
+}
+
+/**
+ * Standard rate-limit response headers per the HTTP RateLimit (IETF draft).
+ * Emitted on every LLM response so clients can self-regulate. The reset window
+ * is calendar-day (midnight UTC) for the daily-cap ceiling.
+ */
+function rateLimitHeaders(limit: number, remaining: number): Record<string, string> {
+  if (limit === Infinity) return {}
+  const midnight = new Date()
+  midnight.setUTCHours(23, 59, 59, 999)
+  const resetSeconds = Math.ceil((midnight.getTime() - Date.now()) / 1000)
+  return {
+    "X-RateLimit-Limit": String(limit),
+    "X-RateLimit-Remaining": String(Math.max(0, remaining)),
+    "X-RateLimit-Reset": String(resetSeconds),
+  }
 }
 
 function freeTurnId(request: Request, body: any): string {
@@ -1408,6 +1429,9 @@ export default {
     }
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders })
 
+    let freeDailyRemaining = 0  // captures the per-request daily-limit state for responseHeaders
+    let freeDailyLimit = FREE_DAILY_LIMIT
+
     // Reject request bodies larger than 1MB
     const contentLength = request.headers.get("content-length")
     if (contentLength && parseInt(contentLength) > 1_048_576) {
@@ -1437,7 +1461,8 @@ export default {
 
     // IP-based rate limiting (all endpoints)
     const ipRl = checkRateLimit(clientIp, ipLimits, IP_RATE_LIMIT)
-    if (!ipRl.allowed) return json({ error: "rate_limited", message: "IP rate limit exceeded: 50 req/min" }, 429, corsHeaders)
+    if (!ipRl.allowed)          corsHeaders["Retry-After"] = "10"
+          return json({ error: "rate_limited", message: "IP rate limit exceeded: 50 req/min" }, 429, corsHeaders)
 
     try {
       // Public endpoints (IP rate limit only)
@@ -1482,6 +1507,7 @@ export default {
       if (user.tier === "free" && isLlmPath) {
         // Global soft brake (~5k free users peak safety; isolate-local)
         if (!freeGlobalAllow(FREE_GLOBAL_SOFT_RPM)) {
+          corsHeaders["Retry-After"] = "60"
           return arcanaErrorResponse(429, "free global soft rate limit", {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1489,6 +1515,7 @@ export default {
         }
         const freeIpRl = checkRateLimit(`free:${clientIp}`, freeIpLimits, FREE_IP_RATE_LIMIT)
         if (!freeIpRl.allowed) {
+          corsHeaders["Retry-After"] = "10"
           return arcanaErrorResponse(429, `Free IP burst limit exceeded: ${FREE_IP_RATE_LIMIT} req/min`, {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1496,6 +1523,7 @@ export default {
         }
         const freeUserRl = checkRateLimit(`free:${user.id}`, freeUserLimits, FREE_USER_RATE_LIMIT)
         if (!freeUserRl.allowed) {
+          corsHeaders["Retry-After"] = "10"
           return arcanaErrorResponse(429, `Free user burst limit exceeded: ${FREE_USER_RATE_LIMIT} req/min`, {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1507,6 +1535,9 @@ export default {
       if (user.tier !== "enterprise" && isLlmPath) {
         const daily = await checkDailyLimit(user.id, user.tier, env.ARCANA_PROXY)
         if (!daily.allowed) {
+          const mid = new Date()
+          mid.setUTCHours(23, 59, 59, 999)
+          corsHeaders["Retry-After"] = String(Math.ceil((mid.getTime() - Date.now()) / 1000))
           return json({
             error: "daily_limit_reached",
             message: user.tier === "free"
@@ -1515,11 +1546,9 @@ export default {
             remaining: 0,
           }, 429, corsHeaders)
         }
-        // Add remaining quota to response headers for LLM requests
-        if (daily.remaining < 50) {
-          corsHeaders["X-RateLimit-Remaining"] = String(daily.remaining)
-        }
       }
+      freeDailyRemaining = daily.remaining
+      freeDailyLimit = DAILY_LIMITS[user.tier] ?? FREE_DAILY_LIMIT
 
       // Match /v1/sessions/:uuid before the switch
       const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/)
@@ -1682,7 +1711,7 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   }
 
   let freeAdmission: FreeTurnAdmission | undefined
-  const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) })
+  const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot), ...(user.tier === "free" ? rateLimitHeaders(freeDailyLimit, freeDailyRemaining) : {}) })
   try {
     if (user.tier === "free") {
       freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
@@ -2233,7 +2262,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
 
   let freeAdmission: FreeTurnAdmission | undefined
   const responseHeaders = () => {
-    const h = { ...cors, ...freeUsageHeaders(freeAdmission?.snapshot) }
+    const h = { ...cors, ...rateLimitHeaders(freeDailyLimit, freeDailyRemaining), ...freeUsageHeaders(freeAdmission?.snapshot) }
     if (freeModelRemap) {
       h["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}->${freeModelRemap.to}`
       h["X-Arcana-Free-Model"] = freeModelRemap.to

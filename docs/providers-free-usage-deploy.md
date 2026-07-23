@@ -261,6 +261,7 @@ to surface):
 | `X-Arcana-Free-Tokens-Used` | Combined in+out tokens settled across this weekly record (display only) |
 | `X-Arcana-Free-Tokens-Limit` | 1,000,000,000 (display ceiling; effectively unlimited) |
 | `X-Arcana-Free-Tokens-Remaining` | `max(0, 1_000_000_000 - tokensUsed)` (effectively unlimited) |
+| `X-Arcana-Load-Band` | Current system load band: `green`, `yellow`, `orange`, or `red`. Set on free-tier chat completions. Not set on paid requests. |
 
 **Note on token count freshness:** the token counters in the response headers reflect the
 *pre-turn* snapshot from `reserveFreeTurn`. The `settleFreeTurn` that increments `tokensUsed`
@@ -268,6 +269,91 @@ runs in `ctx.waitUntil` (fire-and-forget) and writes the updated value to KV, wh
 consistent. The next request that hits `reserveFreeTurn` will see the updated count. A client that
 only reads headers (and never makes a second request) will see the count from before the current
 turn.
+
+## Hybrid load-sensing scheduler
+
+Since 2026-07-22 the proxy includes a dynamic load factor system that adapts
+per-turn resource allocation based on two real-time signals:
+
+1. **Upstream provider error rate** (60 % weight) — tracked via the per-provider
+   circuit breaker. When more than 50 % of requests to OpenRouter (or any
+   provider) fail with 5xx, 429, or network errors, the load factor rises
+   proportionally.
+2. **Local request rate** (40 % weight) — a per-isolate sliding window of
+   free-tier LLM requests (`freeGlobalLoad()`), relative to the
+   `FREE_GLOBAL_SOFT_RPM` ceiling of 120 req/min.
+
+The two signals are combined into a single load factor (0.0–1.0):
+
+```
+loadFactor = clamp(0.6 × (errorRate / 0.5) + 0.4 × (requestRate / 120), 0, 1)
+```
+
+### Option A — per-isolate caching
+
+The load factor is cached per-isolate for 60 seconds (`LOAD_LEVEL_CACHE_TTL`).
+When the cache is stale, the first request to need it recomputes the factor
+from local signals and writes the raw value to KV (`free:load_factor`, TTL
+120 s) via a fire-and-forget promise — zero latency impact on the request path.
+
+```typescript
+// Pseudocode — runtime lives in getLoadLevel() in src/free-routing.ts
+if (cacheHit && cacheAge < 60s) return cached
+factor = compute(errorRate, requestRate)
+ctx.waitUntil(kv.put("free:load_factor", String(factor), { expirationTtl: 120 }))
+cache = { factor, at: now }
+return computeLoadConfig(factor)
+```
+
+### Band-based smooth scaling
+
+The factor is mapped to four bands. Within each band, every resource scales
+**smoothly** (linear interpolation) — no hard breakpoints:
+
+| Band | Threshold | Turn timeout | Output tokens | Model failovers | User RPM |
+| --- | --- | --- | --- | --- | --- |
+| 🟢 **Green** | 0.00–0.33 | 30→25 s | 100k→60k | 15→10 | 8→6 |
+| 🟡 **Yellow** | 0.33–0.66 | 25→18 s | 60k→30k | 10→6 | 6→4 |
+| 🟠 **Orange** | 0.66–0.85 | 18→12 s | 30k→15k | 6→4 | 4→3 |
+| 🔴 **Red** | 0.85–1.00 | 12→8 s | 15k→8k | 4→2 | 3→2 |
+
+At Green, users get the full resource pool. At Red, budgets are tight but the
+product promise (10 turns, 1-hour session) is never broken — only the per-turn
+quality degrades.
+
+### Effort score — per-user fairness
+
+Each free user accumulates an **effort score** from completed turns that
+persists across sessions. The score is the weighted sum of resources consumed:
+
+```
+effortScore = tokensIn × 0.3 + tokensOut × 0.7 + providerCalls × 10
+```
+
+- Stored in KV at `user_cost:<sha256(userId).slice(0,20)>` with 90-day TTL.
+- Score decays 50 % weekly (half-life) so it self-corrects over time.
+- Read at the start of every free turn; the result shifts the effective load
+  factor:
+
+  | User type | Effort score | Load shift | Effect |
+  | --- | --- | --- | --- |
+  | Light | < 1,000 | +0.00 | Default priority |
+  | Medium | 1,000–5,000 | +0.08 | Slightly tighter budgets |
+  | Heavy | > 5,000 | +0.15 | Most restrictive treatment |
+
+A heavy user during Orange band (0.75) sees `effectiveLoad = 0.90`, putting
+them into Red-band budgets — tighter output cap, shorter timeout, fewer
+failover models. Still their 10 turns. Still their 1-hour window.
+
+The effort score is set by `reserveFreeTurn` on the `FreeTurnAdmission` object
+and consumed by `settleFreeTurn` — all 12 call sites automatically accumulate
+scores without per-site changes.
+
+### Response header
+
+| Header | Meaning |
+| --- | --- |
+| `X-Arcana-Load-Band` | One of `green`, `yellow`, `orange`, `red`. Set on free-tier chat-completion success responses. Lets clients observe the current system state. |
 
 ### Rejection codes
 

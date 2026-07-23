@@ -11,6 +11,13 @@
  * classified for Pro / future tiers, not free product path.
  */
 
+import {
+  FREE_SESSION_TURN_LIMIT,
+  FREE_SESSION_DURATION_MS,
+  FREE_SESSION_RESET_MS,
+  FREE_WEEKLY_TOKEN_AGGREGATE,
+} from "./free-config"
+
 export type ClassifiedModel = {
   id: string
   free: boolean
@@ -55,20 +62,6 @@ export const FREE_MODEL_SEED = [
 export const FREE_MODEL_DEFAULT = "openrouter/free"
 
 /**
- * Free product caps. Product intent (2026-07): a free session is one 60-minute
- * window of effectively unlimited use. The 10-turn counter is a SOFT display
- * threshold — it does not hard-block; the only hard stop is the 60-minute
- * session window, after which the weekly (7-day) reset locks the subject out
- * until resetAt. Token caps are unlimited (set high enough to never bind); the
- * server stops tracking them as a gate. Rate limits (FREE_IP/USER/GLOBAL) still
- * pace burst abuse; they do not cap total session usage.
- */
-export const FREE_SESSION_TURN_LIMIT = 10          // soft display threshold only — no hard reject
-export const FREE_SESSION_DURATION_MS = 60 * 60 * 1000   // HARD stop: the only real cap
-export const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-export const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only
-
-/**
  * Progressive wire budgets. With unlimited tokens, all tiers are set to a
  * high ceiling so clampBodyToBudget never truncates free traffic. The tier
  * label is still reported (X-Arcana-Free-Budget-Tier) for observability.
@@ -84,9 +77,9 @@ export const FREE_MAX_INPUT_TOKENS = FREE_BUDGET.expanded.maxInputTokens
 export const FREE_MAX_OUTPUT_TOKENS = FREE_BUDGET.expanded.maxOutputTokens
 
 /** Rate limits sized for ~5k free MAU (peak ~50–100 free LLM req/min globally) */
-export const FREE_IP_RATE_LIMIT = 25 // loosened for single-user deployments
-export const FREE_USER_RATE_LIMIT = 12 // loosened for single-user deployments
-export const FREE_GLOBAL_SOFT_RPM = 200 // loosened for single-user deployments
+export const FREE_IP_RATE_LIMIT = 30 // competitive: matches OpenRouter's 20 RPM per-user + per-IP headroom
+export const FREE_USER_RATE_LIMIT = 20 // competitive: matches OpenRouter's 20 RPM floor
+export const FREE_GLOBAL_SOFT_RPM = 200 // isolate-local soft brake for free LLM paths
 
 const CHINESE_RE =
   /qwen|deepseek|glm|yi-|moonshot|kimi|minimax|baichuan|internlm|stepfun|doubao|hunyuan|ernie|zhipu|01-ai|alibaba|tencent|bytedance|hy3|seedream|yuanbao/i
@@ -617,8 +610,8 @@ export function computeLoadConfig(loadFactor: number): LoadFactorConfig {
 
 const EWMA_ALPHA_FAILURE = 0.30
 const EWMA_ALPHA_SUCCESS = 0.50
-const EWMA_STALE_MS = 60_000
-const EWMA_DECAY_PER_MS = 0.0005  // ~5 % per second when stale → 0 in ~20 s
+const EWMA_STALE_MS = 30_000          // staleness threshold: after 30s idle the error rate resets to 0 (was 60s)
+const EWMA_DECAY_PER_MS = 0.001    // decay rate when stale; at 0.001/ms × 30s idle ≈ 30 >> max rate 1.0 → instant zero
 const EWMA_MIN_OBSERVATIONS = 10
 
 let ewmaErrorRate = 0

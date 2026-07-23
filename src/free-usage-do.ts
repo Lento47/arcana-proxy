@@ -43,14 +43,15 @@ interface FreeUsageRecordDO {
   hydrated: number      // 0 = not yet hydrated from KV, 1 = hydrated
 }
 
-// Mirror the constants from src/index.ts. Kept in sync via the doc-sync check.
-// DO NOT change without updating both files.
-const FREE_SESSION_TURN_LIMIT = 10          // soft display threshold only — no hard reject
-const FREE_SESSION_DURATION_MS = 60 * 60 * 1000   // HARD stop: the only real cap
-const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-const FREE_TURN_MAX_DURATION_MS = 60_000    // 60-second time budget per turn: proxy retries any model/provider until window expires
+import {
+  FREE_SESSION_TURN_LIMIT,
+  FREE_SESSION_DURATION_MS,
+  FREE_SESSION_RESET_MS,
+  FREE_WEEKLY_TOKEN_AGGREGATE,
+  FREE_TURN_MAX_DURATION_MS,
+} from "./free-config"
+
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2
-const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only
 
 type FreeUsageState = "eligible" | "active" | "exhausted" | "expired"
 
