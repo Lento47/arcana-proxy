@@ -11,9 +11,83 @@ lands. Until then, every commit to `master` is a deployable artifact.
 
 ## Unreleased
 
-The four commits listed below are currently on `master` but have not been
-tagged as a release. They are the deliverables from the Cloudflare + free-tier
-work that started 2026-07-14 and finished 2026-07-19.
+The five commits listed below are currently on `master` but have not been
+tagged as a release. The topmost entry is the new hybrid load-sensing
+scheduler and per-user cost tracking delivered 2026-07-22.
+
+### Added — `[hash] feat: hybrid load-sensing scheduler + per-user effort score tracking [bump]`
+
+#### Hybrid load-sensing scheduler
+
+Added a dynamic load factor system that adapts per-turn resource allocation
+based on two real-time signals:
+
+- **Provider error rate** (60 % weight) — tracked via circuit breaker failures
+  across all upstream providers. When > 50 % of requests fail, the load factor
+  rises proportionally.
+- **Local request rate** (40 % weight) — per-isolate sliding window of
+  free-tier LLM requests relative to `FREE_GLOBAL_SOFT_RPM` (120 req/min).
+
+The load factor (0.0–1.0) is smoothed across four bands with smooth scaling
+within each band (no hard breakpoints):
+
+| Band | Threshold | Turn timeout | Output tokens | Model failovers | User RPM |
+| --- | --- | --- | --- | --- | --- |
+| 🟢 Green | 0.00–0.33 | 30→25 s | 100k→60k | 15→10 | 8→6 |
+| 🟡 Yellow | 0.33–0.66 | 25→18 s | 60k→30k | 10→6 | 6→4 |
+| 🟠 Orange | 0.66–0.85 | 18→12 s | 30k→15k | 6→4 | 4→3 |
+| 🔴 Red | 0.85–1.00 | 12→8 s | 15k→8k | 4→2 | 3→2 |
+
+- **Option A caching** — load factor is cached per-isolate for 60 s. When
+  stale, the first request recomputes it and lazily writes the raw factor to
+  KV (`free:load_factor`, TTL 120 s) via a fire-and-forget promise — zero
+  latency impact on the request path.
+- **`X-Arcana-Load-Band: green|yellow|orange|red`** — new response header on
+  free-tier chat completions so clients can observe the current system state.
+- New exports from `src/free-routing.ts`: `LoadFactorConfig`, `LoadLevelBand`,
+  `getLoadLevel()`, `computeLoadConfig()`, `scaleResource()`,
+  `recordCircuitActivity()`, `computeLocalErrorRate()`, `invalidateLoadLevelCache()`.
+- Circuit breaker wired into load sensing — `recordCircuitFailure` /
+  `recordCircuitSuccess` now call `recordCircuitActivity()` to feed the
+  error-rate signal.
+
+#### Per-user effort score tracking
+
+Each free user accumulates an "effort score" from completed turns that
+persists across sessions and deprioritises heavy users during congestion:
+
+```
+effortScore = tokensIn × 0.3 + tokensOut × 0.7 + providerCalls × 10
+```
+
+- Stored in KV at `user_cost:<sha256(userId).slice(0,20)>` with 90-day TTL
+- Score decays 50 % weekly (half-life model) so it self-corrects over time
+- **Light users** (< 1,000 score): no shift → default priority
+- **Medium users** (1,000–5,000): +0.08 load shift → tighter budgets
+- **Heavy users** (> 5,000): +0.15 load shift → most restrictive treatment
+- `FreeTurnAdmission` carries `userId` from `reserveFreeTurn` through to
+  `settleFreeTurn` — all 12 call sites automatically accumulate effort
+  scores without per-site changes.
+- New functions in `src/index.ts`: `readUserEffortScore()`,
+  `writeUserEffortScore()`, `effortShift()`.
+
+#### Files changed
+
+| File | Lines added |
+| --- | --- |
+| `src/free-routing.ts` | ~80 (types, bands, scaling, cache, circuit tracking) |
+| `src/index.ts` | ~160 (imports, wiring, effort score, dynamic timeout/failover/budgets) |
+
+#### Product promise preserved
+
+| Guarantee | Status |
+| --- | --- |
+| 10 turns per session (soft display) | ✅ unchanged |
+| 1-hour session window | ✅ unchanged |
+| Weekly session reset | ✅ unchanged |
+| Free tier: OpenRouter only (no paid routes) | ✅ unchanged |
+
+---
 
 ### Added — `e52e00c docs(arcana-proxy): accuracy pass against deployed code`
 
@@ -142,6 +216,7 @@ worst-case per-user inference cost at 500 free users/week:
 
 | Commit | Subject | Files |
 | --- | --- | --- |
+| [`[hash]`](https://github.com/Lento47/arcana-proxy/commit/[hash]) | `feat: hybrid load-sensing scheduler + per-user effort score tracking [bump]` | `src/free-routing.ts` (~80), `src/index.ts` (~160) |
 | [`e52e00c`](https://github.com/Lento47/arcana-proxy/commit/e52e00c) | `docs(arcana-proxy): accuracy pass against deployed code` | `docs/providers-free-usage-deploy.md` (+62 / −22) |
 | [`2409b63`](https://github.com/Lento47/arcana-proxy/commit/2409b63) | `docs(arcana-proxy): providers, free-usage, deploy reference` | `docs/providers-free-usage-deploy.md` (+397) |
 | [`cee753e`](https://github.com/Lento47/arcana-proxy/commit/cee753e) | `fix(arcana-proxy): cloudflare in primary path + free-tier cap corrections` | `src/index.ts` (+22 / −9), `wrangler.jsonc` |
