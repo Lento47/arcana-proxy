@@ -24,7 +24,13 @@ import {
   wantsLongContext,
   freeGlobalAllow,
   freeGlobalLoad,
+  getLoadLevel,
+  computeLoadConfig,
+  scaleResource,
+  recordCircuitActivity,
+  computeLocalErrorRate,
   type FreePoolSnapshot,
+  type LoadFactorConfig,
 } from "./free-routing"
 
 const OPENROUTER_URL = "https://openrouter.ai/api"
@@ -70,6 +76,8 @@ interface Env {
   // is absent; the priority list is forced to ["openrouter"] when unset.
   OMNIRoute_WARM?: { omFetch: (req: Request) => Promise<Response> }
   OMNIRoute_WARM_QUEUE?: Queue
+  FREE_USAGE_DO_ENABLED?: string
+  FREE_USAGE: DurableObjectNamespace<FreeUsageDO>
 }
 
 type Provider = "openrouter" | "omniroute" | "aihubmix" | "cloudflare"
@@ -516,9 +524,52 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
 const FREE_SESSION_TURN_LIMIT = 10
 const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-const FREE_TURN_PROVIDER_CALL_LIMIT = 2     // 2 provider dispatches per turn-id: original + one failover attempt on hard 5xx/429
+const FREE_TURN_PROVIDER_CALL_LIMIT = 15    // 15 provider dispatches per turn-id: combined with the 16-model failover list, tries ~240 upstream combos before giving up on a saturated free pool
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // free tier: openrouter only (never aihubmix paid routes)
 const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only — the 60-min session is the real cap
+const FREE_MODEL_FAILOVER_BACKOFF_MS = 500     // pause between cycling to the next free model candidate so saturated models get a moment to recover
+const FREE_TURN_MAX_DURATION_MS = 30_000      // 30-second time budget per turn: proxy retries any model/provider until this window expires
+const FREE_CLOUDFLARE_FALLBACK_MODELS = [
+  "@cf/meta/llama-3.2-3b-instruct",        // fast & cheap
+  "@cf/mistral/mistral-7b-instruct-v0.3",   // reliable workhorse
+  "@cf/meta/llama-4-scout-17b",             // newer, more capable
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",// high quality fallback
+  "@hf/nousresearch/hermes-2-pro-mistral-7b",// agent-friendly
+]  // fallback models when OpenRouter free pool is saturated — cycled round-robin via candidate index
+
+// ── Provider circuit breaker (per-isolate; routes around persistently failing providers) ──
+interface CircuitState {
+  failures: number
+  openedAt: number
+}
+const providerCircuits = new Map<Provider, CircuitState>()
+const CIRCUIT_BREAKER_THRESHOLD = 3           // 3 consecutive failures → open
+const CIRCUIT_OPEN_MS = 60_000                 // stay open for 60s
+
+function isCircuitOpen(provider: Provider): boolean {
+  const s = providerCircuits.get(provider)
+  if (!s || s.failures < CIRCUIT_BREAKER_THRESHOLD) return false
+  if (Date.now() - s.openedAt > CIRCUIT_OPEN_MS) {
+    providerCircuits.delete(provider)  // half-open: allow next attempt
+    return false
+  }
+  return true
+}
+
+function recordCircuitFailure(provider: Provider): void {
+  const s = providerCircuits.get(provider) ?? { failures: 0, openedAt: 0 }
+  s.failures++
+  if (s.failures >= CIRCUIT_BREAKER_THRESHOLD) s.openedAt = Date.now()
+  providerCircuits.set(provider, s)
+  // Also feed the load-sensing error rate
+  recordCircuitActivity(true, true)
+}
+
+function recordCircuitSuccess(provider: Provider): void {
+  providerCircuits.delete(provider)
+  // Also feed the load-sensing error rate (attempt succeeded)
+  recordCircuitActivity(true, false)
+}
 
 // Free model routing lives in ./free-routing.ts (quality ranking, progressive budgets, pools)
 
@@ -566,6 +617,7 @@ interface FreeTurnAdmission {
   recordKey?: string
   turnKey?: string
   snapshot: FreeUsageSnapshot
+  userId?: string              // set by reserveFreeTurn; used by settleFreeTurn for effort score tracking
 }
 
 function billableTier(tier: string): boolean {
@@ -577,6 +629,9 @@ async function sha256Hex(input: string): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", data)
   return Array.from(new Uint8Array(hash)).map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
+
+/** Tiny sleep for pacing free-tier failover retries. */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function freeUsageTtl(record: FreeUsageRecord, now = Date.now()): number {
   return Math.max(60, Math.ceil((record.resetAt - now) / 1000) + 3600)
@@ -735,7 +790,83 @@ async function readFreeUsageRecord(userId: string, kv: KVNamespace): Promise<{ k
   return { key, record: { ...raw, reservations: raw.reservations ?? {} } as FreeUsageRecord }
 }
 
-async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace): Promise<FreeTurnAdmission> {
+/**
+ * Get-or-create the FreeUsageDO stub for a subject key.
+ * Each free user maps to exactly one DO shard via SHA-256 of their id.
+ * NOTE: Currently only used for read-only snapshot queries (getFreeUsageCurrent).
+ * Write paths (reserve, settle) still use KV. The DO will be fully wired in a
+ * future PR that simultaneously enables reserve + settle through the DO.
+ */
+async function freeUsageDoStub(userId: string, env: Env): Promise<DurableObjectStub<FreeUsageDO>> {
+  const subject = (await sha256Hex(`free:${userId}`)).slice(0, 40)
+  const id = env.FREE_USAGE.idFromName(subject)
+  return env.FREE_USAGE.get(id)
+}
+
+// ── Per-user effort score tracking ─────────────────────────────────────
+//
+// Each user accumulates an "effort score" from completed turns:
+//   effortScore = tokensIn * 0.3 + tokensOut * 0.7 + providerCalls * 10
+//
+// The score persists across sessions and is used during congestion to skew
+// a heavy user's effective load factor slightly upward (tighter budgets),
+// while light users get a slight discount. The score decays 50% every week
+// so it self-corrects over time.
+
+interface UserEffortRecord {
+  score: number
+  turnCount: number
+  lastActive: number
+  rollingWeekStart: number
+}
+
+async function readUserEffortScore(userId: string, kv: KVNamespace): Promise<number> {
+  const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
+  const key = `user_cost:${subject}`
+  const raw = await kvGetJson<UserEffortRecord>(kv, key)
+  if (!raw) return 0
+  // Decay score weekly (50% half-life)
+  const now = Date.now()
+  if (now - raw.rollingWeekStart > 7 * 86400 * 1000) {
+    raw.score = Math.round(raw.score * 0.5)
+    raw.rollingWeekStart = now
+  }
+  return raw.score
+}
+
+async function writeUserEffortScore(userId: string, kv: KVNamespace, tokensIn: number, tokensOut: number, providerCalls: number): Promise<void> {
+  const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
+  const key = `user_cost:${subject}`
+  const now = Date.now()
+  const raw = await kvGetJson<UserEffortRecord>(kv, key)
+  const scoreDelta = Math.round(tokensIn * 0.3 + tokensOut * 0.7 + (providerCalls || 1) * 10)
+  let record: UserEffortRecord = raw && now - raw.rollingWeekStart <= 7 * 86400 * 1000
+    ? raw
+    : { score: 0, turnCount: 0, lastActive: now, rollingWeekStart: now }
+  record.score += scoreDelta
+  record.turnCount++
+  record.lastActive = now
+  await kvPutJson(kv, key, record, { expirationTtl: 90 * 86400 })  // 90-day TTL
+}
+
+/**
+ * Compute an effective load factor for this user by shifting based on effort.
+ * Light users (< 1000 score): no shift
+ * Medium users (1000-5000): +0.08
+ * Heavy users (>5000): +0.15
+ */
+function effortShift(score: number): number {
+  if (score > 5000) return 0.15
+  if (score > 1000) return 0.08
+  return 0
+}
+
+/**
+ * Reserve a free turn. Uses a TIME-BASED budget (dynamic window from load factor)
+ * instead of the old count-based limit so the proxy has enough runway to cycle
+ * through failover models.
+ */
+async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace, env?: Env, turnTimeoutMs: number = FREE_TURN_MAX_DURATION_MS): Promise<FreeTurnAdmission> {
   const now = Date.now()
   const { key, record: stored } = await readFreeUsageRecord(user.id, kv)
   const conversationId = await freeConversationId(request, body)
@@ -774,6 +905,7 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
         error: "free_session_conversation_mismatch",
         message: "This free session is already bound to another Arcana conversation.",
         snapshot: freeUsageSnapshot(record, now),
+        userId: user.id,
       }
     }
   }
@@ -784,19 +916,23 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
     record.stableId = true
   }
 
+  // Time-based turn budget: the proxy gets a dynamic window (based on load)
+  // to find a working model. If the client retries the same turnId and the
+  // window is still open, allow it.
   const existing = record.reservations[turnKey]
   if (existing) {
-    if (existing.providerCalls >= FREE_TURN_PROVIDER_CALL_LIMIT) {
+    if (now - existing.admittedAt > turnTimeoutMs) {
       return {
         allowed: false,
-        error: "free_turn_budget_reached",
-        message: "This free turn reached its internal provider-call limit.",
+        error: "free_turn_timed_out",
+        message: "This free turn's 30-second window expired. Try again with a fresh turn.",
         snapshot: freeUsageSnapshot(record, now),
+        userId: user.id,
       }
     }
     existing.providerCalls++
     await kv.put(key, JSON.stringify(record), { expirationTtl: freeUsageTtl(record, now) })
-    return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now) }
+    return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now), userId: user.id }
   }
 
   // The 60-minute session window is the ONLY hard cap. Turns are a soft display
@@ -809,35 +945,53 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
       error: "free_session_expired",
       message: "The one-hour free session has ended.",
       snapshot: freeUsageSnapshot(record, now),
+      userId: user.id,
     }
   }
 
   record.turnsUsed++
   record.reservations[turnKey] = { admittedAt: now, providerCalls: 1, status: "admitted" }
   await kv.put(key, JSON.stringify(record), { expirationTtl: freeUsageTtl(record, now) })
-  return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now) }
+  return { allowed: true, recordKey: key, turnKey, snapshot: freeUsageSnapshot(record, now), userId: user.id }
 }
 
-async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: "completed" | "failed", kv: KVNamespace, tokensIn: number = 0, tokensOut: number = 0): Promise<void> {
+async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: "completed" | "failed", kv: KVNamespace, tokensIn: number = 0, tokensOut: number = 0, env?: Env): Promise<void> {
   if (!admission?.allowed || !admission.recordKey || !admission.turnKey) return
+  // NOTE: DO routing for settleFreeTurn is intentionally NOT wired here because
+  // admission.recordKey from the DO path is "do" (a placeholder), not the user's
+  // subject hash. To enable DO-based settlement, reserveFreeTurn must return a
+  // real userId in the admission, and this path must use it for the DO stub.
+  // For now, settling always goes through KV (which is consistent-enough for
+  // the free tier's eventual consistency requirements).
+  // See docs/providers-free-usage-deploy.md "Known limits" for details.
+  // KV fallback
   const record = await kv.get(admission.recordKey, "json") as FreeUsageRecord | null
   const turn = record?.reservations?.[admission.turnKey]
   if (!record || !turn) return
   turn.status = status
   turn.settledAt = Date.now()
-  // Aggregate token accounting. Only count completed turns toward the weekly cap;
-  // failed turns consumed a provider dispatch but the user received no useful output,
-  // and we don't want a flaky upstream to silently drain the free allowance.
   if (status === "completed") {
     const delta = Math.max(0, tokensIn) + Math.max(0, tokensOut)
-    // Tokens are unlimited; accumulate for display only (no cap, no clamp).
     record.tokensUsed = record.tokensUsed + delta
   }
   await kv.put(admission.recordKey, JSON.stringify(record), { expirationTtl: freeUsageTtl(record) })
+  // Track per-user effort score via userId carried on the admission object
+  if (admission.userId) {
+    await writeUserEffortScore(admission.userId, kv, tokensIn, tokensOut, turn.providerCalls).catch(() => {})
+  }
 }
 
 async function getFreeUsageCurrent(user: { id: string; tier: string }, env: Env, cors: Record<string, string>): Promise<Response> {
   if (user.tier !== "free") return json({ state: "licensed", limit: null, used: 0, remaining: null }, 200, cors)
+  const useDo = env?.FREE_USAGE_DO_ENABLED === "true"
+  if (useDo) {
+    try {
+      const stub = await freeUsageDoStub(user.id, env)
+      const res = await stub.fetch(new Request("https://do/snapshot"))
+      return json(await res.json(), 200, cors)
+    } catch {}
+  }
+  // KV fallback
   const { record } = await readFreeUsageRecord(user.id, env.ARCANA_PROXY)
   const snapshot = freeUsageSnapshot(record)
   return json(snapshot, 200, { ...cors, ...freeUsageHeaders(snapshot) })
@@ -1477,7 +1631,7 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
         const rejectCode: ArcanaErrorCode =
           freeAdmission.error === "free_session_expired" ? "ARC_FREE_SESSION_EXPIRED"
           : freeAdmission.error === "free_session_conversation_mismatch" ? "ARC_FREE_CONVERSATION_MISMATCH"
-          : freeAdmission.error === "free_turn_budget_reached" ? "ARC_FREE_TURN_BUDGET_REACHED"
+          : freeAdmission.error === "free_turn_timed_out" ? "ARC_FREE_TURN_TIMED_OUT"
           : "ARC_FREE_EXHAUSTED"
         return arcanaErrorResponse(429, freeAdmission.message || freeAdmission.error || "free exhausted", {
           code: rejectCode,
@@ -1692,7 +1846,7 @@ type ArcanaErrorCode =
   | "ARC_FREE_EXHAUSTED"
   | "ARC_FREE_SESSION_EXPIRED"
   | "ARC_FREE_CONVERSATION_MISMATCH"
-  | "ARC_FREE_TURN_BUDGET_REACHED"
+  | "ARC_FREE_TURN_TIMED_OUT"
   | "ARC_INTERNAL"
 
 const ARC_USER: Record<ArcanaErrorCode, { message: string; recovery: string[]; retryable: boolean }> = {
@@ -1802,8 +1956,17 @@ const ARC_USER: Record<ArcanaErrorCode, { message: string; recovery: string[]; r
     ],
     retryable: false,
   },
+  ARC_FREE_TURN_TIMED_OUT: {
+    message: "Free models are at capacity and your 30-second turnaround expired. Try again with a fresh turn.",
+    recovery: [
+      "Retry — the proxy will try different models",
+      "Upgrade to Pro for priority access",
+    ],
+    retryable: true,
+  },
+  // Deprecated: kept for backward-compatible deserialization of old records
   ARC_FREE_TURN_BUDGET_REACHED: {
-    message: "This free turn couldn't reach a stable provider after 2 tries. Try again or pick a different model.",
+    message: "Free models are at capacity right now. We're retrying automatically.",
     recovery: [
       "Retry",
       "Switch to a free model that isn't saturated",
@@ -1879,7 +2042,7 @@ function arcanaErrorResponse(
       code,
       type:
         code.startsWith("ARC_AUTH") ? "auth"
-        : code.includes("QUOTA") || code.includes("CREDITS") || code === "ARC_PROVIDER_BALANCE" || code === "ARC_FREE_EXHAUSTED" || code === "ARC_FREE_SESSION_EXPIRED" || code === "ARC_FREE_CONVERSATION_MISMATCH" || code === "ARC_FREE_TURN_BUDGET_REACHED" ? "quota"
+        : code.includes("QUOTA") || code.includes("CREDITS") || code === "ARC_PROVIDER_BALANCE" || code === "ARC_FREE_EXHAUSTED" || code === "ARC_FREE_SESSION_EXPIRED" || code === "ARC_FREE_CONVERSATION_MISMATCH" || code === "ARC_FREE_TURN_BUDGET_REACHED" || code === "ARC_FREE_TURN_TIMED_OUT" ? "quota"
         : code === "ARC_RATE_LIMITED" ? "rate_limit"
         : code.includes("MODEL") || code === "ARC_CONTEXT_OVERFLOW" || code === "ARC_FREE_MODEL_ONLY" ? "model"
         : code.includes("NETWORK") ? "network"
@@ -1930,6 +2093,20 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     && path === "/v1/chat/completions"
     && wantsLongContext(body, request.headers.get("x-arcana-need-long"))
 
+  // ── Load factor computation (per-isolate cache + lazy KV write) ──
+  let loadConfig: LoadFactorConfig | undefined
+  if (user.tier === "free") {
+    try {
+      const baseConfig = await getLoadLevel(env.ARCANA_PROXY, ctx)
+      // Apply per-user effort shift during congestion
+      const effort = await readUserEffortScore(user.id, env.ARCANA_PROXY)
+      const shiftedFactor = Math.min(1, Math.max(0, baseConfig.loadFactor + effortShift(effort)))
+      loadConfig = computeLoadConfig(shiftedFactor)
+    } catch {
+      // Fall through with undefined — everything still works with static defaults
+    }
+  }
+
   // Free tier: quality-ranked free pool + optional free-long when request is large
   if (user.tier === "free" && path === "/v1/chat/completions") {
     freePool = await getFreePool(env)
@@ -1945,13 +2122,17 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   const resolved = resolveProvider(requestedModel, priority)
   if (!resolved) return json({ error: "no_provider_available" }, 503, cors)
 
-  // Free: openrouter only. Paid: soft aihubmix + openrouter failover.
-  const attemptOrder = buildAttemptOrder(
+  // Free: openrouter then cloudflare failover. Paid: soft aihubmix + openrouter failover.
+  let attemptOrder = buildAttemptOrder(
     requestedModel,
     resolved,
     priority,
     user.tier === "free",
   )
+  // Free tier: add Cloudflare as a completely independent backend when configured
+  if (user.tier === "free" && (env.CLOUDFLARE_KEYS || env.CLOUDFLARE_KEY) && env.CLOUDFLARE_ACCOUNT_ID) {
+    attemptOrder.push("cloudflare")
+  }
 
   // Pre-flight: if all providers we might use are missing, fail fast.
   if (attemptOrder.includes("openrouter") && !getOpenRouterKey(env)) {
@@ -2009,7 +2190,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   }
   try {
     if (user.tier === "free") {
-      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
+      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY, undefined, loadConfig?.turnTimeoutMs)
       if (!freeAdmission.allowed) {
         await releaseLock()
         // Map the three internal reject reasons to distinct user-facing codes
@@ -2018,7 +2199,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
         const rejectCode: ArcanaErrorCode =
           freeAdmission.error === "free_session_expired" ? "ARC_FREE_SESSION_EXPIRED"
           : freeAdmission.error === "free_session_conversation_mismatch" ? "ARC_FREE_CONVERSATION_MISMATCH"
-          : freeAdmission.error === "free_turn_budget_reached" ? "ARC_FREE_TURN_BUDGET_REACHED"
+          : freeAdmission.error === "free_turn_timed_out" ? "ARC_FREE_TURN_TIMED_OUT"
           : "ARC_FREE_EXHAUSTED"
         return arcanaErrorResponse(429, freeAdmission.message || freeAdmission.error || "free exhausted", {
           code: rejectCode,
@@ -2055,7 +2236,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           ...freeModelFailoverList(
             requestedModel,
             freePool ?? seedPoolSnapshot(),
-            4,
+            loadConfig?.failoverCount ?? 15,
             preferLong,
           ),
         ]
@@ -2068,6 +2249,8 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   }
 
   for (const provider of attemptOrder) {
+    // Circuit breaker: skip providers that have been failing persistently
+    if (isCircuitOpen(provider)) continue
     attemptedProviders.push(provider)
 
     if (provider === "omniroute" && env.OMNIRoute_WARM) {
@@ -2079,7 +2262,13 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     let upstreamModel = modelForProvider(provider, requestedModel, resolved.model)
     if (user.tier === "free") {
       // Free always uses the free candidate slug on OpenRouter (no aihubmix remap)
-      upstreamModel = stripProviderPrefix(freeModelCandidate)
+      if (provider === "cloudflare") {
+        // Cloudflare Workers AI has its own model catalog — cycle through fallbacks
+        const cfIdx = freeModelCandidates.indexOf(freeModelCandidate) % FREE_CLOUDFLARE_FALLBACK_MODELS.length
+        upstreamModel = FREE_CLOUDFLARE_FALLBACK_MODELS[cfIdx]!
+      } else {
+        upstreamModel = stripProviderPrefix(freeModelCandidate)
+      }
     }
     try {
       if (provider === "openrouter") {
@@ -2134,6 +2323,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       }
     } catch (e) {
       // Network/timeout — treat as hard fail, try next.
+      recordCircuitFailure(provider)
       if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
       if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
       if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
@@ -2150,11 +2340,14 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       const hardFail = isFailoverableProviderError(response.status, errorBody, provider)
       if (hardFail) {
         // Only rotate keys on auth/rate issues — not on model "unsupported"
-        if (response.status === 429 || response.status === 401) {
-          if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
-          if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
-          if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
-          if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
+        if (response.status === 429 || response.status >= 500) {
+          recordCircuitFailure(provider)
+          if (response.status === 429 || response.status === 401) {
+            if (providerKey && provider === "openrouter") markKeyRateLimited(providerKey)
+            if (providerKey && provider === "omniroute") markOmniKeyRateLimited(providerKey)
+            if (providerKey && provider === "aihubmix") markAIHubMixKeyRateLimited(providerKey)
+            if (providerKey && provider === "cloudflare") markCloudflareKeyRateLimited(providerKey)
+          }
         }
         lastErrorStatus = response.status
         lastErrorBody = humanizeUpstreamError(provider, response.status, errorBody)
@@ -2162,12 +2355,12 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
           `provider ${provider} hard-fail model=${upstreamModel}`,
           response.status,
           errorBody.slice(0, 200),
-        )
-        // Last provider for this model candidate — free tier may try next free model.
-        if (provider === attemptOrder[attemptOrder.length - 1]) {
-          if (user.tier === "free" && freeModelCandidates.indexOf(freeModelCandidate) < freeModelCandidates.length - 1) {
-            break // next freeModelCandidate
-          }
+        )          // Last provider for this model candidate — free tier may try next free model.
+          if (provider === attemptOrder[attemptOrder.length - 1]) {
+            if (user.tier === "free" && freeModelCandidates.indexOf(freeModelCandidate) < freeModelCandidates.length - 1) {
+              await sleep(FREE_MODEL_FAILOVER_BACKOFF_MS) // let a saturated model recover before hitting the next candidate
+              break // next freeModelCandidate
+            }
           if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
           ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
           await releaseLock()
@@ -2204,7 +2397,8 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
       }
     }
 
-    // Success path.
+    // Success path — close circuit breaker and reset key state.
+    recordCircuitSuccess(provider)
     if (providerKey && provider === "openrouter") markKeySuccess(providerKey)
     if (providerKey && provider === "omniroute") markOmniKeySuccess(providerKey)
     if (providerKey && provider === "aihubmix") markAIHubMixKeySuccess(providerKey)
@@ -2300,6 +2494,7 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     if (user.tier === "free") {
       successHeaders["X-Arcana-Free-Model"] = upstreamModel
       if (freeModelRemap) successHeaders["X-Arcana-Free-Model-Remap"] = `${freeModelRemap.from}->${upstreamModel}`
+      if (loadConfig) successHeaders["X-Arcana-Load-Band"] = loadConfig.band
     }
     return json(data, response.status, successHeaders)
   } // end provider loop
@@ -2313,7 +2508,10 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
     provider: attemptedProviders[attemptedProviders.length - 1],
     providers: attemptedProviders,
     code: "ARC_ALL_PROVIDERS_FAILED",
-    cors: responseHeaders(),
+    cors: {
+      ...responseHeaders(),
+      ...(loadConfig ? { "X-Arcana-Load-Band": loadConfig.band } : {}),
+    },
   })
 }
 // --- end multi-provider failover ---

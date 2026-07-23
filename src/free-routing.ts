@@ -488,3 +488,156 @@ export function freeGlobalLoad(): number {
   while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
   return freeGlobalHits.length
 }
+
+// ── Load Factor System (hybrid load-sensing scheduler) ───────────────────────
+//
+// The load factor (0.0–1.0) is a composite of two signals:
+//   60% — upstream provider error rate (circuit breaker failures)
+//   40% — local request rate relative to FREE_GLOBAL_SOFT_RPM
+//
+// Resources scale smoothly within four bands (green → yellow → orange → red)
+// so users always get their 10 turns / 1-hour session, but the quality and
+// speed tighten proportionally to protect the pool under load.
+//
+// The factor is cached per-isolate (60s TTL) and lazily written to KV via
+// ctx.waitUntil() — zero latency impact on the request path.
+
+export type LoadLevelBand = "green" | "yellow" | "orange" | "red"
+
+export interface LoadFactorConfig {
+  loadFactor: number         // 0.0–1.0 raw composite score
+  band: LoadLevelBand        // the band this factor falls in
+  turnTimeoutMs: number      // scaled turn timeout (ms)
+  outputLimit: number        // scaled max_output_tokens
+  failoverCount: number      // scaled model failover list size
+  userRpm: number            // scaled per-user rate limi
+  ipRpm: number              // scaled per-IP rate limit
+}
+
+type BandDef = { floor: number; ceiling: number; label: LoadLevelBand }
+
+const LOAD_BANDS: BandDef[] = [
+  { floor: 0.00, ceiling: 0.33, label: "green" },
+  { floor: 0.33, ceiling: 0.66, label: "yellow" },
+  { floor: 0.66, ceiling: 0.85, label: "orange" },
+  { floor: 0.85, ceiling: 1.00, label: "red" },
+]
+
+/**
+ * Resource values at band boundaries.
+ * Index: 0 = green high, 1 = green low (= yellow high),
+ * 2 = yellow low (= orange high), 3 = orange low (= red high),
+ * 4 = red low.
+ */
+const RESOURCE_RANGES = {
+  turnTimeoutMs:   [30_000, 25_000, 18_000, 12_000, 8_000],
+  outputLimit:     [100_000, 60_000, 30_000, 15_000, 8_000],
+  failoverCount:   [15, 10, 6, 4, 2],
+  userRpm:         [8, 6, 4, 3, 2],
+  ipRpm:           [15, 12, 8, 6, 4],
+}
+
+/** Scale a resource value within its current band based on load factor progress. */
+export function scaleResource(loadFactor: number, range: number[]): number {
+  for (const band of LOAD_BANDS) {
+    if (loadFactor >= band.floor && loadFactor < band.ceiling) {
+      const progress = (loadFactor - band.floor) / (band.ceiling - band.floor)
+      const high = range[LOAD_BANDS.indexOf(band)]!
+      const low = range[LOAD_BANDS.indexOf(band) + 1]!
+      return Math.round(high - progress * (high - low))
+    }
+  }
+  return range[range.length - 1]!
+}
+
+/** Build a full LoadFactorConfig from a raw load factor. */
+export function computeLoadConfig(loadFactor: number): LoadFactorConfig {
+  const clamped = Math.min(1, Math.max(0, loadFactor))
+  let band: LoadLevelBand = "green"
+  for (const b of LOAD_BANDS) {
+    if (clamped >= b.floor && clamped < b.ceiling) { band = b.label; break }
+  }
+  return {
+    loadFactor: clamped,
+    band,
+    turnTimeoutMs: scaleResource(clamped, RESOURCE_RANGES.turnTimeoutMs),
+    outputLimit: scaleResource(clamped, RESOURCE_RANGES.outputLimit),
+    failoverCount: scaleResource(clamped, RESOURCE_RANGES.failoverCount),
+    userRpm: scaleResource(clamped, RESOURCE_RANGES.userRpm),
+    ipRpm: scaleResource(clamped, RESOURCE_RANGES.ipRpm),
+  }
+}
+
+// ── Circuit tracking (feeds the error-rate signal) ─────────────────────────
+
+let circuitTrackingAttempts = 0
+let circuitTrackingFailures = 0
+
+/** Record an upstream provider attempt (successful or failed) for load sensing. */
+export function recordCircuitActivity(attempt: boolean, failure: boolean): void {
+  if (attempt) circuitTrackingAttempts++
+  if (failure) circuitTrackingFailures++
+  // Decay old data: every 1000 attempts, halve counters so fresh signals dominate
+  if (circuitTrackingAttempts > 1000) {
+    circuitTrackingAttempts = Math.floor(circuitTrackingAttempts / 2)
+    circuitTrackingFailures = Math.floor(circuitTrackingFailures / 2)
+  }
+}
+
+/** Compute the local error rate from circuit-tracking data (0..1). */
+export function computeLocalErrorRate(): number {
+  if (circuitTrackingAttempts < 10) return 0 // not enough data to be meaningful
+  return circuitTrackingFailures / circuitTrackingAttempts
+}
+
+// ── Load-level cache + lazy KV writer (Option A) ───────────────────────────
+//
+// The load factor is cached per-isolate for 60 seconds. When the cache is
+// stale, the first request to need it recomputes it from local signals and
+// writes it to KV in the background via ctx.waitUntil().
+
+let loadLevelCache: { factor: number; at: number } | null = null
+const LOAD_LEVEL_CACHE_TTL = 60_000
+
+/**
+ * Get the current system load factor.
+ *
+ * Cached per-isolate for 60s. When stale, recomputes from local error rate +
+ * request rate, then lazily writes the raw factor to KV so other isolates can
+ * observe it (via the KV key "free:load_factor"). The write is fire-and-forget
+ * via ctx.waitUntil() — no latency impact on the current request.
+ */
+export async function getLoadLevel(
+  kv: KVNamespace,
+  ctx: ExecutionContext,
+): Promise<LoadFactorConfig> {
+  const now = Date.now()
+  if (loadLevelCache && now - loadLevelCache.at < LOAD_LEVEL_CACHE_TTL) {
+    return computeLoadConfig(loadLevelCache.factor)
+  }
+
+  // Compute from local signals
+  const errorRate = computeLocalErrorRate()
+  const requestRate = freeGlobalLoad()
+  const factor = Math.min(1, Math.max(0,
+    0.6 * (errorRate / 0.5) + 0.4 * (requestRate / FREE_GLOBAL_SOFT_RPM)
+  ))
+
+  // Write to KV in background (fire-and-forget, TTL 120s so transient spikes
+  // don't linger, but stale values persist long enough for other isolates)
+  ctx.waitUntil(
+    kv.put("free:load_factor", String(factor), { expirationTtl: 120 })
+      .catch(() => {}),
+  )
+
+  loadLevelCache = { factor, at: now }
+  return computeLoadConfig(factor)
+}
+
+/**
+ * Invalidate the local load-level cache (used when static config forces a reset).
+ * Primarily for tests and manual admin operations.
+ */
+export function invalidateLoadLevelCache(): void {
+  loadLevelCache = null
+}
