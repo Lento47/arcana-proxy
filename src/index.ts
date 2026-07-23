@@ -478,11 +478,38 @@ interface SendEmail {
   }): Promise<{ messageId: string }>
 }
 
-// Per-IP + per-user rate limiting
-const ipLimits = new Map<string, { count: number; resetAt: number }>()
-const userLimits = new Map<string, { count: number; resetAt: number }>()
-const freeIpLimits = new Map<string, { count: number; resetAt: number }>()
-const freeUserLimits = new Map<string, { count: number; resetAt: number }>()
+// ── EWMA Token-Bucket Rate Limiting ────────────────────────────────────
+//
+// Replaced the old fixed-window counter (checkRateLimit) with a token-bucket
+// algorithm.  The old fixed window had two failure modes:
+//   1. Window-boundary doubling: a burst at second 59 + another at second 0
+//      could admit 2× the limit inside 2 seconds.
+//   2. Binary block/allow: once the counter hits the limit, EVERY request is
+//      rejected until the window resets — up to 60 s of complete denial.
+//
+// Token-bucket fixes both: tokens refill continuously at (limit / 60) per
+// second, up to a burst capacity (BURST_MULTIPLIER × limit).  This:
+//   - Allows LEGITIMATE bursts (up to burst capacity tokens)
+//   - Recovers GRADUALLY (tokens trickle back, no 60 s blackout)
+//   - Has NO window-boundary artefact (tokens are continuous)
+//
+// Single-user bias: effectiveLimit = limit × BIAS_MULTIPLIER (1.5×).
+// The user is the only one using the system — blocking their requests
+// is always a false positive.  We'd rather let through a few extra
+// requests than block a single real one.
+
+const BURST_MULTIPLIER = 3        // max burst = 3× the per-minute limit
+const BIAS_MULTIPLIER = 1.5       // single-user effective limit headroom
+
+interface TokenBucket {
+  tokens: number     // current token count (fractional, continuous refill)
+  lastRefill: number // timestamp of last token refill
+}
+
+const ipLimits = new Map<string, TokenBucket>()
+const userLimits = new Map<string, TokenBucket>()
+const freeIpLimits = new Map<string, TokenBucket>()
+const freeUserLimits = new Map<string, TokenBucket>()
 const IP_RATE_LIMIT = 50
 const USER_RATE_LIMIT = 25
 // Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
@@ -492,7 +519,38 @@ const USER_RATE_LIMIT = 25
 const FREE_IP_RATE_LIMIT = FREE_IP_RATE_LIMIT_CFG
 const FREE_USER_RATE_LIMIT = FREE_USER_RATE_LIMIT_CFG
 const FREE_BURST_PATHS = new Set(["/v1/chat/completions", "/v1/embeddings", "/v1/images/generations", "/v1/images"])
-const RATE_WINDOW = 60000
+
+function checkRateLimit(
+  key: string,
+  map: Map<string, TokenBucket>,
+  limit: number,
+): { allowed: boolean; remaining: number } {
+  const now = Date.now()
+  const effectiveLimit = Math.round(limit * BIAS_MULTIPLIER)
+  const refillRate = effectiveLimit / 60_000  // tokens per ms
+  const maxTokens = effectiveLimit * BURST_MULTIPLIER
+
+  let bucket = map.get(key)
+  if (!bucket) {
+    bucket = { tokens: maxTokens, lastRefill: now }
+    map.set(key, bucket)
+  }
+
+  // Refill tokens based on time elapsed
+  const elapsed = now - bucket.lastRefill
+  if (elapsed > 0) {
+    bucket.tokens = Math.min(maxTokens, bucket.tokens + refillRate * elapsed)
+  }
+  bucket.lastRefill = now
+
+  // Allow if we have at least 1 token
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1
+    return { allowed: true, remaining: Math.floor(bucket.tokens) }
+  }
+
+  return { allowed: false, remaining: 0 }
+}
 
 // Daily usage limits by tier
 const DAILY_LIMITS: Record<string, number> = {
@@ -1276,15 +1334,6 @@ async function getUser(auth: string | null, kv: KVNamespace, ctx: ExecutionConte
   return null
 }
 
-function checkRateLimit(key: string, map: Map<string, { count: number; resetAt: number }>, limit: number): { allowed: boolean; remaining: number } {
-  const now = Date.now()
-  const entry = map.get(key)
-  if (!entry || now > entry.resetAt) { map.set(key, { count: 1, resetAt: now + RATE_WINDOW }); return { allowed: true, remaining: limit - 1 } }
-  if (entry.count >= limit) return { allowed: false, remaining: 0 }
-  entry.count++
-  return { allowed: true, remaining: limit - entry.count }
-}
-
 async function getPayPalToken(env: Env): Promise<string> {
   const mode = env.PAYPAL_SANDBOX === "true" ? "sandbox" : "live"
   const base = env.PAYPAL_SANDBOX === "true" ? PAYPAL_SANDBOX : PAYPAL_LIVE
@@ -1365,14 +1414,25 @@ export default {
       return json({ error: "payload_too_large", message: "Request body exceeds 1MB limit" }, 413, corsHeaders)
     }
 
-    // Periodic cleanup of rate limit maps (every 100 requests instead of setInterval)
+    // Periodic cleanup of rate limit maps (every 100 requests)
+    // Token-bucket cleanup: remove entries that have refilled to full capacity
+    // (i.e., haven't been used in BURST_MULTIPLIER * 60 seconds)
     cleanupCounter++
     if (cleanupCounter % 100 === 0) {
       const now = Date.now()
-      for (const [key, val] of ipLimits.entries()) { if (now > val.resetAt) ipLimits.delete(key) }
-      for (const [key, val] of userLimits.entries()) { if (now > val.resetAt) userLimits.delete(key) }
-      for (const [key, val] of freeIpLimits.entries()) { if (now > val.resetAt) freeIpLimits.delete(key) }
-      for (const [key, val] of freeUserLimits.entries()) { if (now > val.resetAt) freeUserLimits.delete(key) }
+      const staleThreshold = 60_000 * BURST_MULTIPLIER // full bucket refill time
+      for (const [key, bucket] of ipLimits.entries()) {
+        if (now - bucket.lastRefill > staleThreshold) ipLimits.delete(key)
+      }
+      for (const [key, bucket] of userLimits.entries()) {
+        if (now - bucket.lastRefill > staleThreshold) userLimits.delete(key)
+      }
+      for (const [key, bucket] of freeIpLimits.entries()) {
+        if (now - bucket.lastRefill > staleThreshold) freeIpLimits.delete(key)
+      }
+      for (const [key, bucket] of freeUserLimits.entries()) {
+        if (now - bucket.lastRefill > staleThreshold) freeUserLimits.delete(key)
+      }
     }
 
     // IP-based rate limiting (all endpoints)

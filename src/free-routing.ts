@@ -471,13 +471,31 @@ export function wantsLongContext(body: any, headerFlag?: string | null): boolean
   return chars >= 12_000
 }
 
-// ── Global free soft rate (per isolate — best-effort for 5k scale) ─────────
+// ── EWMA Global free soft rate (per isolate — best-effort for 5k scale) ────
+//
+// EWMA-smoothed load tracker.  rawCount is the instantaneous sliding-window
+// count (same as before).  smoothedLoad is an EWMA of that count, updated
+// on every allow().  This prevents a single burst from looking like sustained
+// load — the load factor only rises if the burst persists.
 
 const freeGlobalHits: number[] = []
+
+let globalLoadEwma = 0
+let globalLoadEwmaLast = 0
+const GLOBAL_LOAD_EWMA_ALPHA = 0.25
 
 export function freeGlobalAllow(rpm = FREE_GLOBAL_SOFT_RPM): boolean {
   const now = Date.now()
   while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
+
+  // Update EWMA load (before adding this request, so it reflects prior load)
+  if (globalLoadEwmaLast > 0 && now > globalLoadEwmaLast) {
+    globalLoadEwma = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
+  } else if (globalLoadEwmaLast === 0) {
+    globalLoadEwma = freeGlobalHits.length
+  }
+  globalLoadEwmaLast = now
+
   if (freeGlobalHits.length >= rpm) return false
   freeGlobalHits.push(now)
   return true
@@ -486,7 +504,16 @@ export function freeGlobalAllow(rpm = FREE_GLOBAL_SOFT_RPM): boolean {
 export function freeGlobalLoad(): number {
   const now = Date.now()
   while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
-  return freeGlobalHits.length
+  // Return the EWMA-smoothed value without mutating state.
+  // Only freeGlobalAllow() updates the EWMA — this keeps the smoothed
+  // signal stable when load is queried multiple times in one request cycle.
+  if (globalLoadEwmaLast > 0 && now > globalLoadEwmaLast) {
+    // Compute what the EWMA would be, but leave globalLoadEwma alone
+    // so a subsequent freeGlobalAllow() doesn't double-count.
+    const updated = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
+    return Math.round(Math.max(0, updated))
+  }
+  return Math.round(Math.max(0, globalLoadEwma))
 }
 
 // ── Load Factor System (hybrid load-sensing scheduler) ───────────────────────
@@ -568,26 +595,66 @@ export function computeLoadConfig(loadFactor: number): LoadFactorConfig {
   }
 }
 
-// ── Circuit tracking (feeds the error-rate signal) ─────────────────────────
+// ── EWMA Circuit tracking (feeds the error-rate signal) ────────────────────
+//
+// Replaced raw-ratio + broken-halving-decay with true EWMA.
+// The old approach (failures / attempts) had a fatal bias: halving both
+// counters preserves the exact ratio. 3 failures in 10 attempts = 0.3;
+// halve both → 1 failure in 5 attempts = still 0.3.  The error rate never
+// decayed on its own — it could only be diluted by hundreds of fresh
+// successes.  For a single-user deployment a transient upstream blip
+// permanently elevated the load factor, throttling all subsequent requests.
+//
+// New approach: EWMA with per-observation alpha.  Each observation updates
+// the smoothed error rate.  α=0.30 on failures (30 % weight to new signal),
+// α=0.50 on successes (faster recovery — error rate drops 50 % per success).
+// Staleness: if no activity for 60 s, error rate decays toward 0 at 5 %/s.
+// Minimum 10 observations before reporting a non-zero rate (warm-up guard).
 
-let circuitTrackingAttempts = 0
-let circuitTrackingFailures = 0
+const EWMA_ALPHA_FAILURE = 0.30
+const EWMA_ALPHA_SUCCESS = 0.50
+const EWMA_STALE_MS = 60_000
+const EWMA_DECAY_PER_MS = 0.0005  // ~5 % per second when stale → 0 in ~20 s
+const EWMA_MIN_OBSERVATIONS = 10
+
+let ewmaErrorRate = 0
+let ewmaErrorCount = 0
+let ewmaErrorLastUpdate = 0
 
 /** Record an upstream provider attempt (successful or failed) for load sensing. */
 export function recordCircuitActivity(attempt: boolean, failure: boolean): void {
-  if (attempt) circuitTrackingAttempts++
-  if (failure) circuitTrackingFailures++
-  // Decay old data: every 1000 attempts, halve counters so fresh signals dominate
-  if (circuitTrackingAttempts > 1000) {
-    circuitTrackingAttempts = Math.floor(circuitTrackingAttempts / 2)
-    circuitTrackingFailures = Math.floor(circuitTrackingFailures / 2)
+  const now = Date.now()
+
+  // Apply staleness decay if we've been idle
+  if (ewmaErrorCount > 0 && ewmaErrorLastUpdate > 0 && now - ewmaErrorLastUpdate > EWMA_STALE_MS) {
+    const idleMs = now - ewmaErrorLastUpdate
+    ewmaErrorRate = Math.max(0, ewmaErrorRate - EWMA_DECAY_PER_MS * idleMs)
+  }
+
+  ewmaErrorLastUpdate = now
+
+  // EWMA update: new observation gets α weight, history gets (1-α) weight
+  if (attempt) {
+    const alpha = failure ? EWMA_ALPHA_FAILURE : EWMA_ALPHA_SUCCESS
+    const observation = failure ? 1.0 : 0.0
+    ewmaErrorRate = alpha * observation + (1 - alpha) * ewmaErrorRate
+    ewmaErrorCount++
   }
 }
 
-/** Compute the local error rate from circuit-tracking data (0..1). */
+/** Compute the local error rate from circuit-tracking data (0..1, EWMA-smoothed). */
 export function computeLocalErrorRate(): number {
-  if (circuitTrackingAttempts < 10) return 0 // not enough data to be meaningful
-  return circuitTrackingFailures / circuitTrackingAttempts
+  if (ewmaErrorCount < EWMA_MIN_OBSERVATIONS) return 0
+  // Compute staleness decay on a transient copy — do NOT mutate the global
+  // ewmaErrorRate or ewmaErrorLastUpdate.  The write side (recordCircuitActivity)
+  // owns the authoritative state; the read side decays a snapshot on the fly.
+  const now = Date.now()
+  let rate = ewmaErrorRate
+  if (ewmaErrorLastUpdate > 0 && now - ewmaErrorLastUpdate > EWMA_STALE_MS) {
+    const idleMs = now - ewmaErrorLastUpdate
+    rate = Math.max(0, rate - EWMA_DECAY_PER_MS * idleMs)
+  }
+  return Math.min(1, Math.max(0, rate))
 }
 
 // ── Load-level cache + lazy KV writer (Option A) ───────────────────────────
@@ -595,6 +662,14 @@ export function computeLocalErrorRate(): number {
 // The load factor is cached per-isolate for 60 seconds. When the cache is
 // stale, the first request to need it recomputes it from local signals and
 // writes it to KV in the background via ctx.waitUntil().
+//
+// Single-user bias: for deployments with one user (the common case), subtract
+// LOAD_BIAS_SINGLE_USER (0.20) from the computed factor.  This biases the
+// rate limiter toward false positives (allowing requests) rather than false
+// negatives (blocking them).  The user is the only one using the system —
+// there is no contention to protect against.
+
+const LOAD_BIAS_SINGLE_USER = 0.20
 
 let loadLevelCache: { factor: number; at: number } | null = null
 const LOAD_LEVEL_CACHE_TTL = 60_000
@@ -616,12 +691,15 @@ export async function getLoadLevel(
     return computeLoadConfig(loadLevelCache.factor)
   }
 
-  // Compute from local signals
+  // Compute from local signals (EWMA error rate, no more broken halving bias)
   const errorRate = computeLocalErrorRate()
   const requestRate = freeGlobalLoad()
-  const factor = Math.min(1, Math.max(0,
+  const rawFactor = Math.min(1, Math.max(0,
     0.6 * (errorRate / 0.5) + 0.4 * (requestRate / FREE_GLOBAL_SOFT_RPM)
   ))
+  // Single-user bias: subtract to favor allowing over blocking.
+  // Negative load factor stays green; positive but low stays green longer.
+  const factor = Math.max(0, rawFactor - LOAD_BIAS_SINGLE_USER)
 
   // Write to KV in background (fire-and-forget, TTL 120s so transient spikes
   // don't linger, but stale values persist long enough for other isolates)
