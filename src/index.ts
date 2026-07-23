@@ -582,11 +582,11 @@ async function checkDailyLimit(userId: string, tier: string, kv: KVNamespace): P
 const FREE_SESSION_TURN_LIMIT = 10
 const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-const FREE_TURN_PROVIDER_CALL_LIMIT = 15    // 15 provider dispatches per turn-id: combined with the 16-model failover list, tries ~240 upstream combos before giving up on a saturated free pool
+const FREE_TURN_PROVIDER_CALL_LIMIT = 25    // 25 provider dispatches per turn-id: combined with the 20-model failover list, tries ~500 upstream combos before giving up on a saturated free pool
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2          // free tier: openrouter only (never aihubmix paid routes)
 const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only — the 60-min session is the real cap
-const FREE_MODEL_FAILOVER_BACKOFF_MS = 500     // pause between cycling to the next free model candidate so saturated models get a moment to recover
-const FREE_TURN_MAX_DURATION_MS = 30_000      // 30-second time budget per turn: proxy retries any model/provider until this window expires
+const FREE_MODEL_FAILOVER_BACKOFF_MS = 300     // pause between cycling to the next free model candidate so saturated models cycle faster
+const FREE_TURN_MAX_DURATION_MS = 60_000      // 60-second time budget per turn (was 30s): proxy has more runway to find a working free model
 const FREE_CLOUDFLARE_FALLBACK_MODELS = [
   "@cf/meta/llama-3.2-3b-instruct",        // fast & cheap
   "@cf/mistral/mistral-7b-instruct-v0.3",   // reliable workhorse
@@ -983,7 +983,7 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
       return {
         allowed: false,
         error: "free_turn_timed_out",
-        message: "This free turn's 30-second window expired. Try again with a fresh turn.",
+        message: "This free turn's window expired. Try again with a fresh turn.",
         snapshot: freeUsageSnapshot(record, now),
         userId: user.id,
       }

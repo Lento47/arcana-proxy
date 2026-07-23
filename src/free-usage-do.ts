@@ -48,7 +48,7 @@ interface FreeUsageRecordDO {
 const FREE_SESSION_TURN_LIMIT = 10          // soft display threshold only — no hard reject
 const FREE_SESSION_DURATION_MS = 60 * 60 * 1000   // HARD stop: the only real cap
 const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
-const FREE_TURN_PROVIDER_CALL_LIMIT = 2
+const FREE_TURN_MAX_DURATION_MS = 60_000    // 60-second time budget per turn: proxy retries any model/provider until window expires
 const FREE_PROVIDER_ATTEMPT_LIMIT = 2
 const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000  // unlimited in practice; display ceiling only
 
@@ -192,11 +192,12 @@ export class FreeUsageDO {
     // 2. existing reservation (idempotent retry on the same turn_id)
     const existing = reservations[req.turnKey]
     if (existing) {
-      if (existing.providerCalls >= FREE_TURN_PROVIDER_CALL_LIMIT) {
+      // Time-based budget: the proxy gets 30 seconds to find a working model
+      if (req.now - existing.admittedAt > FREE_TURN_MAX_DURATION_MS) {
         return {
           allowed: false,
-          error: "free_turn_budget_reached",
-          message: "This free turn reached its internal provider-call limit.",
+          error: "free_turn_timed_out",
+          message: "This free turn's window expired. Try again with a fresh turn.",
           snapshot: snapshot(record, now),
         }
       }
