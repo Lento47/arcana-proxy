@@ -520,7 +520,7 @@ const userLimits = new Map<string, TokenBucket>()
 const freeIpLimits = new Map<string, TokenBucket>()
 const freeUserLimits = new Map<string, TokenBucket>()
 const IP_RATE_LIMIT = 50
-const USER_RATE_LIMIT = 25
+const USER_RATE_LIMIT = 60
 // Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
 // Workspace GETs (balance, sessions, memory, profile) must not share this bucket —
 // a single dashboard load is already 3–5 parallel requests and used to 429 at 8/min.
