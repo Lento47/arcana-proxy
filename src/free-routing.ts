@@ -78,7 +78,7 @@ export const FREE_MAX_OUTPUT_TOKENS = FREE_BUDGET.expanded.maxOutputTokens
 
 /** Rate limits sized for ~5k free MAU (peak ~50–100 free LLM req/min globally) */
 export const FREE_IP_RATE_LIMIT = 30 // competitive: matches OpenRouter's 20 RPM per-user + per-IP headroom
-export const FREE_USER_RATE_LIMIT = 20 // competitive: matches OpenRouter's 20 RPM floor
+export const FREE_USER_RATE_LIMIT = 40 // competitive: matches OpenRouter's 20 RPM floor
 export const FREE_GLOBAL_SOFT_RPM = 200 // isolate-local soft brake for free LLM paths
 
 const CHINESE_RE =
