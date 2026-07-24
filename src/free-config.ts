@@ -15,8 +15,8 @@ export const FREE_SESSION_TURN_LIMIT = 10
 /** Hard stop: the only real cap on a free session. */
 export const FREE_SESSION_DURATION_MS = 60 * 60 * 1000
 
-/** 24-hour rolling window: after this time from session start, a new session may begin. */
-export const FREE_SESSION_RESET_MS = 24 * 60 * 60 * 1000
+/** 7-day rolling window: after this time from session start, a new session may begin. */
+export const FREE_SESSION_RESET_MS = 7 * 24 * 60 * 60 * 1000
 
 /** Unlimited in practice; display ceiling only. */
 export const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000

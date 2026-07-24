@@ -23,6 +23,10 @@
     { "binding": "ARCANA_LICENSE", "id": "63e54bc7b2e8405cb4db5d926e1f2685" }
   ],
 
+  "d1_databases": [
+    { "binding": "ARCANA_DB", "database_name": "arcana-proxy-db", "database_id": "8c11c2b8-e4b1-4966-a2a1-d0cb95a5fd73" }
+  ],
+
   "analytics_engine_datasets": [
     { "binding": "ARCANA_PROXY_ANALYTICS", "dataset": "arcana_proxy_usage" }
   ],

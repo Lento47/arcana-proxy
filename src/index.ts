@@ -87,6 +87,7 @@ interface Env {
   OMNIRoute_WARM_QUEUE?: Queue
   FREE_USAGE_DO_ENABLED?: string
   FREE_USAGE: DurableObjectNamespace<FreeUsageDO>
+  ARCANA_DB: D1Database
 }
 
 type Provider = "openrouter" | "omniroute" | "aihubmix" | "cloudflare"
@@ -882,50 +883,71 @@ async function freeUsageDoStub(userId: string, env: Env): Promise<DurableObjectS
   return env.FREE_USAGE.get(id)
 }
 
-// ── Per-user effort score tracking ─────────────────────────────────────
+// ── Per-user effort score tracking (D1-backed, replacing KV) ─────────
 //
 // Each user accumulates an "effort score" from completed turns:
 //   effortScore = tokensIn * 0.3 + tokensOut * 0.7 + providerCalls * 10
 //
-// The score persists across sessions and is used during congestion to skew
-// a heavy user's effective load factor slightly upward (tighter budgets),
-// while light users get a slight discount. The score decays 50% every week
-// so it self-corrects over time.
+// Stored in D1 `effort_scores` table. Score decays 50% weekly (half-life).
+// Reads are cheap (single-row SELECT by primary key); writes are fire-and-forget
+// via ctx.waitUntil, so they never block the request path.
 
-interface UserEffortRecord {
-  score: number
-  turnCount: number
-  lastActive: number
-  rollingWeekStart: number
+async function readUserEffortScore(userId: string, db: D1Database): Promise<number> {
+  const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
+  try {
+    const row = await db.prepare(
+      "SELECT score, rolling_week_start FROM effort_scores WHERE user_id = ?"
+    ).bind(subject).first<{ score: number; rolling_week_start: number }>()
+    if (!row || row.score === undefined) return 0
+    const now = Date.now()
+    if (now - row.rolling_week_start > 7 * 86400 * 1000) {
+      return Math.round(row.score * 0.5)
+    }
+    return row.score
+  } catch { return 0 }
 }
 
-async function readUserEffortScore(userId: string, kv: KVNamespace): Promise<number> {
+async function writeUserEffortScore(userId: string, _kv: KVNamespace, tokensIn: number, tokensOut: number, providerCalls: number, db?: D1Database): Promise<void> {
+  if (!db) return
   const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
-  const key = `user_cost:${subject}`
-  const raw = await kvGetJson<UserEffortRecord>(kv, key)
-  if (!raw) return 0
-  // Decay score weekly (50% half-life)
   const now = Date.now()
-  if (now - raw.rollingWeekStart > 7 * 86400 * 1000) {
-    raw.score = Math.round(raw.score * 0.5)
-    raw.rollingWeekStart = now
-  }
-  return raw.score
-}
-
-async function writeUserEffortScore(userId: string, kv: KVNamespace, tokensIn: number, tokensOut: number, providerCalls: number): Promise<void> {
-  const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
-  const key = `user_cost:${subject}`
-  const now = Date.now()
-  const raw = await kvGetJson<UserEffortRecord>(kv, key)
   const scoreDelta = Math.round(tokensIn * 0.3 + tokensOut * 0.7 + (providerCalls || 1) * 10)
-  let record: UserEffortRecord = raw && now - raw.rollingWeekStart <= 7 * 86400 * 1000
-    ? raw
-    : { score: 0, turnCount: 0, lastActive: now, rollingWeekStart: now }
-  record.score += scoreDelta
-  record.turnCount++
-  record.lastActive = now
-  await kvPutJson(kv, key, record, { expirationTtl: 90 * 86400 })  // 90-day TTL
+  try {
+    await db.prepare(`
+      INSERT INTO effort_scores (user_id, score, turn_count, last_active, rolling_week_start)
+      VALUES (?, ?, 1, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        score = CASE WHEN ? - rolling_week_start > 604800000 THEN ROUND(score * 0.5) + ? ELSE score + ? END,
+        turn_count = turn_count + 1,
+        last_active = ?,
+        rolling_week_start = CASE WHEN ? - rolling_week_start > 604800000 THEN ? ELSE rolling_week_start END
+    `).bind(subject, scoreDelta, now, now, now, scoreDelta, scoreDelta, now, now, now).run()
+  } catch {}
+}
+
+/**
+ * Log a free-usage event to D1 for analytics (fire-and-forget).
+ */
+async function writeFreeUsageEvent(userId: string, freeSessionId: string, status: "completed" | "failed", tokensIn: number, tokensOut: number, providerCalls: number, db: D1Database): Promise<void> {
+  const subject = (await sha256Hex(`effort:${userId}`)).slice(0, 20)
+  try {
+    await db.prepare(
+      "INSERT INTO free_usage_events (user_id, free_session_id, status, tokens_in, tokens_out, provider_calls, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(subject, freeSessionId, status, tokensIn, tokensOut, providerCalls, Date.now()).run()
+  } catch {}
+}
+
+/**
+ * Log a rate-limit event to D1 (fire-and-forget, ctx.waitUntil).
+ * Called on every 429 response so operators can monitor which limits fire
+ * most often, which users/IPs are affected, and whether limits need tuning.
+ */
+async function logRateLimitEvent(limitType: string, clientIp: string, userId: string | null, tier: string | null, db: D1Database): Promise<void> {
+  try {
+    await db.prepare(
+      "INSERT INTO rate_limit_events (user_id, client_ip, limit_type, tier, created_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(userId || null, clientIp, limitType, tier || null, Date.now()).run()
+  } catch {}
 }
 
 /**
@@ -947,6 +969,28 @@ function effortShift(score: number): number {
  */
 async function reserveFreeTurn(request: Request, body: any, user: { id: string; tier: string }, inputTokens: number, kv: KVNamespace, env?: Env, turnTimeoutMs: number = FREE_TURN_MAX_DURATION_MS): Promise<FreeTurnAdmission> {
   const now = Date.now()
+
+  // ── DO path (atomic reservation, gated by FREE_USAGE_DO_ENABLED) ──────
+  const useDo = env?.FREE_USAGE_DO_ENABLED === "true"
+  if (useDo && env) {
+    try {
+      const conversationId = await freeConversationId(request, body)
+      const sessionKey = (await sha256Hex(`session:${conversationId}`)).slice(0, 40)
+      const turnKey = (await sha256Hex(`turn:${freeTurnId(request, body)}`)).slice(0, 40)
+      const stub = await freeUsageDoStub(user.id, env)
+      const res = await stub.fetch(new Request("https://do/reserve", {
+        method: "POST",
+        body: JSON.stringify({ sessionKey, turnKey, inputTokens, now }),
+      }))
+      const result = (await res.json()) as FreeTurnAdmission
+      result.userId = user.id
+      return result
+    } catch {
+      // DO unavailable — fall through to KV path
+    }
+  }
+
+  // ── KV path (legacy: eventually consistent, not atomic) ──────────────
   const { key, record: stored } = await readFreeUsageRecord(user.id, kv)
   const conversationId = await freeConversationId(request, body)
   const stableId = hasStableConversationId(request, body)
@@ -1035,15 +1079,37 @@ async function reserveFreeTurn(request: Request, body: any, user: { id: string; 
 }
 
 async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: "completed" | "failed", kv: KVNamespace, tokensIn: number = 0, tokensOut: number = 0, env?: Env): Promise<void> {
-  if (!admission?.allowed || !admission.recordKey || !admission.turnKey) return
-  // NOTE: DO routing for settleFreeTurn is intentionally NOT wired here because
-  // admission.recordKey from the DO path is "do" (a placeholder), not the user's
-  // subject hash. To enable DO-based settlement, reserveFreeTurn must return a
-  // real userId in the admission, and this path must use it for the DO stub.
-  // For now, settling always goes through KV (which is consistent-enough for
-  // the free tier's eventual consistency requirements).
-  // See docs/providers-free-usage-deploy.md "Known limits" for details.
-  // KV fallback
+  if (!admission?.allowed || !admission.turnKey) return
+
+  // ── DO path (atomic settlement, gated by FREE_USAGE_DO_ENABLED) ─────
+  const useDo = env?.FREE_USAGE_DO_ENABLED === "true"
+  if (useDo && admission.userId && env) {
+    try {
+      const stub = await freeUsageDoStub(admission.userId, env)
+      const res = await stub.fetch(new Request("https://do/settle", {
+        method: "POST",
+        body: JSON.stringify({
+          turnKey: admission.turnKey,
+          status,
+          tokensIn,
+          tokensOut,
+          now: Date.now(),
+        }),
+      }))
+      const { ok } = (await res.json()) as { ok: boolean }
+      if (ok && admission.userId) {
+        // Note: providerCalls is tracked by the DO internally; we pass 1 as a
+        // best-effort estimate for the effort score (which is approximate anyway).
+        await writeUserEffortScore(admission.userId, kv, tokensIn, tokensOut, 1, env.ARCANA_DB).catch(() => {})
+        await writeFreeUsageEvent(admission.userId, admission.snapshot?.freeSessionId || "unknown", status, tokensIn, tokensOut, 1, env.ARCANA_DB).catch(() => {})
+      }
+      return
+    } catch {
+      // DO unavailable — fall through to KV path
+    }
+  }
+
+  // ── KV path (legacy: eventually consistent) ─────────────────────────
   const record = await kv.get(admission.recordKey, "json") as FreeUsageRecord | null
   const turn = record?.reservations?.[admission.turnKey]
   if (!record || !turn) return
@@ -1056,7 +1122,8 @@ async function settleFreeTurn(admission: FreeTurnAdmission | undefined, status: 
   await kv.put(admission.recordKey, JSON.stringify(record), { expirationTtl: freeUsageTtl(record) })
   // Track per-user effort score via userId carried on the admission object
   if (admission.userId) {
-    await writeUserEffortScore(admission.userId, kv, tokensIn, tokensOut, turn.providerCalls).catch(() => {})
+    await writeUserEffortScore(admission.userId, kv, tokensIn, tokensOut, turn.providerCalls, env.ARCANA_DB).catch(() => {})
+    await writeFreeUsageEvent(admission.userId, admission.snapshot?.freeSessionId || "unknown", status, tokensIn, tokensOut, turn.providerCalls, env.ARCANA_DB).catch(() => {})
   }
 }
 
@@ -1463,6 +1530,7 @@ export default {
     const ipRl = checkRateLimit(clientIp, ipLimits, IP_RATE_LIMIT)
     if (!ipRl.allowed) {
       corsHeaders["Retry-After"] = "10"
+      ctx.waitUntil(logRateLimitEvent("ip_burst", clientIp, null, null, env.ARCANA_DB))
       return arcanaErrorResponse(429, `IP rate limit exceeded: ${IP_RATE_LIMIT} req/min`, {
         code: "ARC_RATE_LIMITED",
         cors: corsHeaders,
@@ -1494,6 +1562,14 @@ export default {
           if (request.method === "POST") return handleAdminMintLicense(request, env, corsHeaders)
           return json({ error: "method_not_allowed" }, 405, corsHeaders)
         }
+        if (url.pathname === "/v1/admin/migrate-effort-scores") {
+          if (request.method === "POST") return handleAdminMigrateEffortScores(env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        }
+        if (url.pathname === "/v1/admin/rate-limits") {
+          if (request.method === "GET") return handleAdminRateLimits(env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
+        }
         return json({ error: "not_found" }, 404, corsHeaders)
       }
 
@@ -1505,6 +1581,7 @@ export default {
       const userRl = checkRateLimit(user.id, userLimits, USER_RATE_LIMIT)
       if (!userRl.allowed) {
         corsHeaders["Retry-After"] = "10"
+        ctx.waitUntil(logRateLimitEvent("user_burst", clientIp, user.id, user.tier, env.ARCANA_DB))
         return arcanaErrorResponse(429, `${USER_RATE_LIMIT} req/min per user`, {
           code: "ARC_RATE_LIMITED",
           cors: corsHeaders,
@@ -1519,6 +1596,7 @@ export default {
         // Global soft brake (~5k free users peak safety; per-user token bucket)
         if (!freeGlobalAllow(user.id, FREE_GLOBAL_SOFT_RPM)) {
           corsHeaders["Retry-After"] = "60"
+          ctx.waitUntil(logRateLimitEvent("free_global_soft", clientIp, user.id, user.tier, env.ARCANA_DB))
           return arcanaErrorResponse(429, "free global soft rate limit", {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1527,6 +1605,7 @@ export default {
         const freeIpRl = checkRateLimit(`free:${clientIp}`, freeIpLimits, FREE_IP_RATE_LIMIT)
         if (!freeIpRl.allowed) {
           corsHeaders["Retry-After"] = "10"
+          ctx.waitUntil(logRateLimitEvent("free_ip_burst", clientIp, user.id, user.tier, env.ARCANA_DB))
           return arcanaErrorResponse(429, `Free IP burst limit exceeded: ${FREE_IP_RATE_LIMIT} req/min`, {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1535,6 +1614,7 @@ export default {
         const freeUserRl = checkRateLimit(`free:${user.id}`, freeUserLimits, FREE_USER_RATE_LIMIT)
         if (!freeUserRl.allowed) {
           corsHeaders["Retry-After"] = "10"
+          ctx.waitUntil(logRateLimitEvent("free_user_burst", clientIp, user.id, user.tier, env.ARCANA_DB))
           return arcanaErrorResponse(429, `Free user burst limit exceeded: ${FREE_USER_RATE_LIMIT} req/min`, {
             code: "ARC_RATE_LIMITED",
             cors: corsHeaders,
@@ -1549,10 +1629,11 @@ export default {
           const mid = new Date()
           mid.setUTCHours(23, 59, 59, 999)
           corsHeaders["Retry-After"] = String(Math.ceil((mid.getTime() - Date.now()) / 1000))
+          ctx.waitUntil(logRateLimitEvent("daily_limit", clientIp, user.id, user.tier, env.ARCANA_DB))
           return json({
             error: "daily_limit_reached",
             message: user.tier === "free"
-              ? "Daily limit reached (50 requests). Upgrade to Pro for 2,000/day."
+              ? `Daily limit reached (${FREE_DAILY_LIMIT} requests). Upgrade to Pro for ${DAILY_LIMITS.pro.toLocaleString()}/day.`
               : "Daily limit reached. Upgrade your plan for more capacity.",
             remaining: 0,
           }, 429, corsHeaders)
@@ -1690,6 +1771,9 @@ export default {
             freeUserRpm: FREE_USER_RATE_LIMIT,
             freeIpRpm: FREE_IP_RATE_LIMIT,
           }, 200, corsHeaders)
+        case "/v1/analytics":
+          if (request.method === "GET") return handleGetAnalytics(user, env, corsHeaders)
+          return json({ error: "method_not_allowed" }, 405, corsHeaders)
         default:
           return json({ error: "not_found" }, 404, corsHeaders)
       }
@@ -1727,6 +1811,7 @@ async function proxyOpenRouter(
   if (currentLock !== lockValue && user.tier !== "enterprise") {
     // Lock TTL is 60s; locks usually release quickly after the prior request finishes.
     cors["Retry-After"] = "3"
+    ctx.waitUntil(logRateLimitEvent("lock_conflict", request.headers.get("cf-connecting-ip") ?? "unknown", user.id, user.tier, env.ARCANA_DB))
     return arcanaErrorResponse(429, "A previous request is still processing.", {
       code: "ARC_RATE_LIMITED",
       cors,
@@ -1743,9 +1828,14 @@ async function proxyOpenRouter(
   const responseHeaders = () => ({ ...cors, ...freeUsageHeaders(freeAdmission?.snapshot), ...(user.tier === "free" ? rateLimitHeaders(freeDailyLimit, freeDailyRemaining) : {}) })
   try {
     if (user.tier === "free") {
-      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY)
+      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY, env)
       if (!freeAdmission.allowed) {
         await releaseLock()
+        const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown"
+        ctx.waitUntil(logRateLimitEvent(
+          freeAdmission.error === "free_session_expired" ? "free_session_expired" : "free_exhausted",
+          clientIp, user.id, user.tier, env.ARCANA_DB
+        ))
         const rejectCode: ArcanaErrorCode =
           freeAdmission.error === "free_session_expired" ? "ARC_FREE_SESSION_EXPIRED"
           : freeAdmission.error === "free_session_conversation_mismatch" ? "ARC_FREE_CONVERSATION_MISMATCH"
@@ -1766,7 +1856,7 @@ async function proxyOpenRouter(
 
   const openRouterKey = getOpenRouterKey(env)
   if (!openRouterKey) {
-    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
     await releaseLock()
     return json({ error: "no_api_key", message: "No OpenRouter API key configured" }, 500, responseHeaders())
   }
@@ -1789,7 +1879,7 @@ async function proxyOpenRouter(
   if (cfPrefixed) {
     const cfKey = getCloudflareKey(env)
     if (!cfKey || !env.CLOUDFLARE_ACCOUNT_ID) {
-      ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+      ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
       await releaseLock()
       return json({ error: "no_api_key", message: "No Cloudflare account ID or API token configured" }, 500, responseHeaders())
     }
@@ -1803,7 +1893,7 @@ async function proxyOpenRouter(
   if (!response.ok) {
     if (response.status === 429 || response.status === 401) markKeyRateLimited(openRouterKey)
     if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
     await releaseLock()
     const errorBody = await response.text()
     return arcanaErrorResponse(response.status, errorBody, {
@@ -1845,10 +1935,10 @@ async function proxyOpenRouter(
           adjustBalance(usage.inputTokens, usage.outputTokens, usage.totalCost)
           const sc = (usage.totalCost ?? estimateCost(body.model, usage.inputTokens, usage.outputTokens)) * margin * 100
           ctx.waitUntil(recordSession(user, body.model, "openrouter", usage.inputTokens, usage.outputTokens, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
-          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens))
+          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : usage.inputTokens, streamFailed ? 0 : usage.outputTokens, env))
         }
         else if (streamFailed && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-        if (streamFailed) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+        if (streamFailed) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
         await releaseLock()
       }
     })()
@@ -1865,7 +1955,7 @@ async function proxyOpenRouter(
     const sc = (openRouterCost ?? estimateCost(body.model, tokensIn, tokensOut)) * margin * 100
     ctx.waitUntil(recordSession(user, body.model, "openrouter", tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
   }
-  ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut))
+  ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut, env))
   await releaseLock()
   return json(data, response.status, responseHeaders())
 }
@@ -2227,7 +2317,7 @@ async function proxyWithFailover(
     try {
       const baseConfig = await getLoadLevel(env.ARCANA_PROXY, ctx)
       // Apply per-user effort shift during congestion
-      const effort = await readUserEffortScore(user.id, env.ARCANA_PROXY)
+      const effort = await readUserEffortScore(user.id, env.ARCANA_DB)
       const shiftedFactor = Math.min(1, Math.max(0, baseConfig.loadFactor + effortShift(effort)))
       loadConfig = computeLoadConfig(shiftedFactor)
     } catch {
@@ -2292,6 +2382,7 @@ async function proxyWithFailover(
   if (currentLock !== lockValue && user.tier !== "enterprise") {
     // Lock TTL is 60s; locks usually release quickly after the prior request finishes.
     cors["Retry-After"] = "3"
+    ctx.waitUntil(logRateLimitEvent("lock_conflict", request.headers.get("cf-connecting-ip") ?? "unknown", user.id, user.tier, env.ARCANA_DB))
     return arcanaErrorResponse(429, "A previous request is still processing.", {
       code: "ARC_RATE_LIMITED",
       cors,
@@ -2323,7 +2414,7 @@ async function proxyWithFailover(
   }
   try {
     if (user.tier === "free") {
-      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY, undefined, loadConfig?.turnTimeoutMs)
+      freeAdmission = await reserveFreeTurn(request, body, user, inputTokens, env.ARCANA_PROXY, env, loadConfig?.turnTimeoutMs)
       if (!freeAdmission.allowed) {
         await releaseLock()
         // Map the three internal reject reasons to distinct user-facing codes
@@ -2495,7 +2586,7 @@ async function proxyWithFailover(
               break // next freeModelCandidate
             }
           if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-          ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+          ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
           await releaseLock()
           return arcanaErrorResponse(lastErrorStatus, lastErrorBody, {
             provider,
@@ -2520,7 +2611,7 @@ async function proxyWithFailover(
         }
         // True client-side error — bubble up, refund.
         if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-        ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+        ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
         await releaseLock()
         return arcanaErrorResponse(response.status, errorBody, {
           provider,
@@ -2599,9 +2690,9 @@ async function proxyWithFailover(
           const servedModel = extractStreamModel(fullResponse) ?? (user.tier === "free" ? upstreamModel : resolved.model)
           const sc = (usage?.totalCost ?? estimateCost(resolved.model, uIn, uOut)) * margin * 100
           ctx.waitUntil(recordSession(user, servedModel, provider, uIn, uOut, sc, Date.now() - startTime, streamFailed ? "failed" : "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
-          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : uIn, streamFailed ? 0 : uOut))
+          ctx.waitUntil(settleFreeTurn(freeAdmission, streamFailed ? "failed" : "completed", env.ARCANA_PROXY, streamFailed ? 0 : uIn, streamFailed ? 0 : uOut, env))
           if (!usage && streamFailed && !failoverTriggered && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-          if (streamFailed && !failoverTriggered) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+          if (streamFailed && !failoverTriggered) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
           await releaseLock()
         }
       })()
@@ -2621,7 +2712,7 @@ async function proxyWithFailover(
     const servedModel = (data?.model as string) ?? (user.tier === "free" ? upstreamModel : resolved.model)
     const sc = (upstreamCost ?? estimateCost(resolved.model, tokensIn, tokensOut)) * margin * 100
     ctx.waitUntil(recordSession(user, servedModel, provider, tokensIn, tokensOut, sc, Date.now() - startTime, "completed", body.messages?.length ?? 0, env.ARCANA_PROXY, { firstMessage: previewUserMessage(body.messages) }))
-    ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut))
+    ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut, env))
     await releaseLock()
     const successHeaders: Record<string, string> = { ...responseHeaders(), "X-Provider": provider }
     if (user.tier === "free") {
@@ -2635,7 +2726,7 @@ async function proxyWithFailover(
 
   // All providers / free models failed.
   if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
-  ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY))
+  ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
   await releaseLock()
   return arcanaErrorResponse(lastErrorStatus, lastErrorBody, {
     provider: attemptedProviders[attemptedProviders.length - 1],
@@ -3267,6 +3358,53 @@ async function handleAdminMintLicense(request: Request, env: Env, cors: Record<s
     }))
   }
   return json({ licenseKey: key, tier: plan, createdAt }, 200, cors)
+}
+
+// ── Admin: KV user_cost:* → D1 effort_scores migration ──────────────────
+// One-shot migration endpoint. Lists all KV keys with prefix "user_cost:",
+// reads each JSON record, and upserts into the D1 effort_scores table.
+// Idempotent — safe to run multiple times. Returns count of migrated records.
+async function handleAdminMigrateEffortScores(env: Env, cors: Record<string, string>): Promise<Response> {
+  const kv = env.ARCANA_PROXY
+  const db = env.ARCANA_DB
+  let migrated = 0
+  let errors = 0
+  let cursor: string | undefined
+
+  try {
+    do {
+      const list = await kv.list({ prefix: "user_cost:", cursor, limit: 1000 })
+      for (const kvKey of list.keys) {
+        try {
+          const raw = await kv.get(kvKey.name, "json") as { score: number; turnCount: number; lastActive: number; rollingWeekStart: number } | null
+          if (!raw || raw.score === undefined) continue
+          // The KV key is "user_cost:<sha256_prefix>" — the suffix IS the D1 user_id
+          const userId = kvKey.name.slice("user_cost:".length)
+          if (!userId) continue
+          await db.prepare(`
+            INSERT INTO effort_scores (user_id, score, turn_count, last_active, rolling_week_start)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              score = excluded.score,
+              turn_count = excluded.turn_count,
+              last_active = excluded.last_active,
+              rolling_week_start = excluded.rolling_week_start
+          `).bind(userId, raw.score, raw.turnCount ?? 0, raw.lastActive ?? Date.now(), raw.rollingWeekStart ?? Date.now()).run()
+          migrated++
+        } catch { errors++ }
+      }
+      cursor = list.list_complete ? undefined : list.cursor
+    } while (cursor)
+
+    return json({
+      ok: true,
+      migrated,
+      errors,
+      message: `Migrated ${migrated} effort scores from KV to D1${errors > 0 ? ` (${errors} errors)` : ""}.`,
+    }, 200, cors)
+  } catch (e) {
+    return json({ ok: false, migrated, errors, error: String(e) }, 500, cors)
+  }
 }
 
 async function sendSubscriptionEmail(env: Env, to: string, key: string, planName: string, price: number = 19): Promise<void> {
@@ -4049,6 +4187,155 @@ async function listModels(env: Env, cors: Record<string, string>): Promise<Respo
   if (models.length > 0) return json({ object: "list", data: models }, 200, cors)
   if (errors.length > 0) return json({ error: "models_unavailable", providers: errors }, 502, cors)
   return json({ error: "no_api_key", message: "No provider API key configured" }, 500, cors)
+}
+
+// ── Analytics endpoint (D1-backed) ──────────────────────────────────────
+// Returns per-user analytics: effort score, token totals, success rate,
+// and recent activity from the D1 free_usage_events table.
+async function handleAdminRateLimits(env: Env, cors: Record<string, string>): Promise<Response> {
+  const db = env.ARCANA_DB
+  try {
+    // Global summary: counts by limit_type (last 7 days + all-time)
+    const now = Date.now()
+    const sevenDaysAgo = now - 7 * 86400 * 1000
+
+    const { results: byType7d } = await db.prepare(`
+      SELECT limit_type, COUNT(*) as count, MAX(created_at) as last_at
+      FROM rate_limit_events
+      WHERE created_at > ?
+      GROUP BY limit_type
+      ORDER BY count DESC
+    `).bind(sevenDaysAgo).all<{ limit_type: string; count: number; last_at: number }>()
+
+    const { results: byTypeAll } = await db.prepare(`
+      SELECT limit_type, COUNT(*) as count
+      FROM rate_limit_events
+      GROUP BY limit_type
+      ORDER BY count DESC
+    `).all<{ limit_type: string; count: number }>()
+
+    // Top user IDs being rate limited (last 7 days)
+    const { results: topUsers } = await db.prepare(`
+      SELECT user_id, client_ip, COUNT(*) as count, MAX(created_at) as last_at
+      FROM rate_limit_events
+      WHERE created_at > ?
+      GROUP BY user_id, client_ip
+      ORDER BY count DESC
+      LIMIT 20
+    `).bind(sevenDaysAgo).all<{ user_id: string | null; client_ip: string; count: number; last_at: number }>()
+
+    // Hourly breakdown (last 48h)
+    const { results: hourly } = await db.prepare(`
+      SELECT (created_at / 3600000) * 3600000 as hour, COUNT(*) as count
+      FROM rate_limit_events
+      WHERE created_at > ?
+      GROUP BY hour
+      ORDER BY hour DESC
+    `).bind(now - 48 * 3600000).all<{ hour: number; count: number }>()
+
+    return json({
+      totals: {
+        sevenDays: (byType7d ?? []).reduce((s, r) => s + r.count, 0),
+        allTime: (byTypeAll ?? []).reduce((s, r) => s + r.count, 0),
+      },
+      byType: {
+        sevenDays: Object.fromEntries((byType7d ?? []).map(r => [r.limit_type, { count: r.count, lastAt: new Date(r.last_at).toISOString() }])),
+        allTime: Object.fromEntries((byTypeAll ?? []).map(r => [r.limit_type, r.count])),
+      },
+      topUsers: (topUsers ?? []).map(r => ({
+        userId: r.user_id,
+        clientIp: r.client_ip,
+        count: r.count,
+        lastAt: new Date(r.last_at).toISOString(),
+      })),
+      hourly: (hourly ?? []).reverse().map(r => ({
+        hour: new Date(r.hour).toISOString(),
+        count: r.count,
+      })),
+    }, 200, cors)
+  } catch (e) {
+    return json({ error: "rate_limits_unavailable", message: String(e) }, 500, cors)
+  }
+}
+
+async function handleGetAnalytics(user: { id: string; tier: string }, env: Env, cors: Record<string, string>): Promise<Response> {
+  const db = env.ARCANA_DB
+  const subject = (await sha256Hex(`effort:${user.id}`)).slice(0, 20)
+
+  try {
+    // Effort score
+    const effortRow = await db.prepare(
+      "SELECT score, turn_count, last_active FROM effort_scores WHERE user_id = ?"
+    ).bind(subject).first<{ score: number; turn_count: number; last_active: number }>()
+
+    // Token totals + success rate (last 30 days)
+    const statsRow = await db.prepare(`
+      SELECT
+        COUNT(*) as total_turns,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+        SUM(tokens_in) as total_tokens_in,
+        SUM(tokens_out) as total_tokens_out,
+        SUM(provider_calls) as total_provider_calls
+      FROM free_usage_events
+      WHERE user_id = ? AND created_at > ?
+    `).bind(subject, Date.now() - 30 * 86400 * 1000).first<{
+      total_turns: number; completed: number;
+      total_tokens_in: number; total_tokens_out: number; total_provider_calls: number
+    }>()
+
+    // Recent activity (last 50 events)
+    const { results: recent } = await db.prepare(
+      "SELECT status, tokens_in, tokens_out, provider_calls, created_at FROM free_usage_events WHERE user_id = ? ORDER BY created_at DESC LIMIT 50"
+    ).bind(subject).all<{
+      status: string; tokens_in: number; tokens_out: number;
+      provider_calls: number; created_at: number
+    }>()
+
+    // Rate-limit hits for this user (last 30 days, grouped by type)
+    const { results: rateLimitHits } = await db.prepare(`
+      SELECT limit_type, COUNT(*) as count, MAX(created_at) as last_at
+      FROM rate_limit_events
+      WHERE user_id = ? AND created_at > ?
+      GROUP BY limit_type
+      ORDER BY count DESC
+    `).bind(subject, Date.now() - 30 * 86400 * 1000).all<{ limit_type: string; count: number; last_at: number }>()
+
+    // Total 429s this user hit (last 30 days)
+    const { total: totalRateLimits } = await db.prepare(
+      "SELECT COUNT(*) as total FROM rate_limit_events WHERE user_id = ? AND created_at > ?"
+    ).bind(subject, Date.now() - 30 * 86400 * 1000).first<{ total: number }>() ?? { total: 0 }
+
+    return json({
+      effort: effortRow ? {
+        score: effortRow.score,
+        turnCount: effortRow.turn_count,
+        lastActive: effortRow.last_active ? new Date(effortRow.last_active).toISOString() : null,
+      } : { score: 0, turnCount: 0, lastActive: null },
+      usage: statsRow ? {
+        totalTurns: statsRow.total_turns ?? 0,
+        completed: statsRow.completed ?? 0,
+        failed: (statsRow.total_turns ?? 0) - (statsRow.completed ?? 0),
+        successRate: statsRow.total_turns > 0 ? Math.round((statsRow.completed / statsRow.total_turns) * 100) : 0,
+        totalTokensIn: statsRow.total_tokens_in ?? 0,
+        totalTokensOut: statsRow.total_tokens_out ?? 0,
+        totalTokens: (statsRow.total_tokens_in ?? 0) + (statsRow.total_tokens_out ?? 0),
+        totalProviderCalls: statsRow.total_provider_calls ?? 0,
+      } : null,
+      recent: (recent ?? []).map((r: any) => ({
+        status: r.status,
+        tokensIn: r.tokens_in,
+        tokensOut: r.tokens_out,
+        providerCalls: r.provider_calls,
+        createdAt: new Date(r.created_at).toISOString(),
+      })),
+      rateLimits: {
+        total: totalRateLimits,
+        byType: Object.fromEntries((rateLimitHits ?? []).map(h => [h.limit_type, { count: h.count, lastAt: new Date(h.last_at).toISOString() }])),
+      },
+    }, 200, cors)
+  } catch (e) {
+    return json({ error: "analytics_unavailable", message: String(e) }, 500, cors)
+  }
 }
 
 async function getUserUsage(user: { id: string }, env: Env, cors: Record<string, string>): Promise<Response> {

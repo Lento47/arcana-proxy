@@ -230,12 +230,12 @@ Free users (`tier === "free"`) are subject to the following limits. The spec liv
 | Burst limit (IP) | 15 req/min | `FREE_IP_RATE_LIMIT` | `rate_limited` |
 | Burst limit (user) | 8 req/min | `FREE_USER_RATE_LIMIT` | `rate_limited` |
 | Weekly token aggregate | unlimited (1,000,000,000 display ceiling — never binds) | `FREE_WEEKLY_TOKEN_AGGREGATE` | — (retired) |
-| Daily request limit | unlimited | `DAILY_LIMITS.free` (`Infinity`) | — |
+| Daily request limit | 500 | `DAILY_LIMITS.free` (`FREE_DAILY_LIMIT` = 500) | `daily_limit_reached` |
 
 **Product intent (2026-07):** a free session is one 60-minute window of effectively unlimited
 use. The 10-turn counter is a **soft** display threshold — the proxy still counts and reports it
 (`X-Arcana-Free-Used` / `X-Arcana-Free-Remaining`) but never rejects on it. Token caps (per-turn
-and weekly) and the daily request count are unlimited. The only hard terminal reject is
+and weekly) are unlimited; the daily request limit is 500 (enforced per calendar day). The only hard terminal reject is
 `free_session_expired` when the 60-minute window ends; the record then persists until `resetAt`
 (7 days), which is what enforces the weekly cooldown. Burst rate limits (IP/user/global) still
 pace request frequency to protect the free pool — they do not cap total session usage.
@@ -379,8 +379,8 @@ side — no automatic retry. Separately, **burst / concurrency 429s** from the p
 
 | Path | Typical `Retry-After` |
 | --- | --- |
-| IP rate limit | `10` |
-| User rate limit (`USER_RATE_LIMIT` req/min) | `10` |
+| IP rate limit | `50` |
+| User rate limit (`USER_RATE_LIMIT` req/min) | `60` |
 | Free IP / free user burst | `10` |
 | Free global soft limit | `60` |
 | Daily limit | seconds until UTC midnight |
