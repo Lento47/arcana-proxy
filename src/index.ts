@@ -2712,7 +2712,7 @@ async function proxyWithFailover(
           const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path.replace(/^\/v1/, "")}`
           const headers = new Headers({
             "Content-Type": "application/json",
-            "cf-aig-authorization": gatewayKey!,
+            "cf-aig-authorization": `Bearer ${gatewayKey}`,
           })
           response = await fetch(gwUrl, { method: "POST", headers, body: JSON.stringify(outbound) })
           providerKey = gatewayKey
