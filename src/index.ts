@@ -66,6 +66,8 @@ interface Env {
   CLOUDFLARE_KEY?: string
   CLOUDFLARE_KEYS?: string      // comma-separated pool of Cloudflare API tokens (Workers AI: Read)
   CLOUDFLARE_ACCOUNT_ID?: string  // Cloudflare account ID; required for Workers AI
+  CLOUDFLARE_AI_GATEWAY_ENDPOINT?: string  // AI Gateway base URL (e.g. https://gateway.ai.cloudflare.com/v1/{account}/{gateway})
+  CLOUDFLARE_AI_GATEWAY_KEY?: string       // AI Gateway API key (required when GATEWAY_ENDPOINT is set)
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
   PAYPAL_SANDBOX?: string
@@ -1999,15 +2001,27 @@ async function proxyOpenRouter(
   const isStream = body.stream === true
   let response: Response
   if (cfPrefixed) {
-    const cfKey = getCloudflareKey(env)
-    if (!cfKey || !env.CLOUDFLARE_ACCOUNT_ID) {
-      ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
-      await releaseLock()
-      return json({ error: "no_api_key", message: "No Cloudflare account ID or API token configured" }, 500, responseHeaders())
+    // AI Gateway path: uses gateway endpoint + gateway API key
+    const useGateway = !!(env.CLOUDFLARE_AI_GATEWAY_ENDPOINT && env.CLOUDFLARE_AI_GATEWAY_KEY)
+    if (useGateway) {
+      const gwUrl = `${env.CLOUDFLARE_AI_GATEWAY_ENDPOINT!.replace(/\/+$/, "")}${path}`
+      const gwHeaders = new Headers({ "Content-Type": "application/json", "cf-aig-authorization": `Bearer ${env.CLOUDFLARE_AI_GATEWAY_KEY}` })
+      response = await fetch(gwUrl, { method: "POST", headers: gwHeaders, body: JSON.stringify(body) })
+      if (!response.ok && response.status === 401) {
+        return json({ error: "ai_gateway_auth_failed", message: "AI Gateway rejected the apiKey. Check CLOUDFLARE_AI_GATEWAY_KEY." }, 502, responseHeaders())
+      }
+    } else {
+      // Direct Workers AI path
+      const cfKey = getCloudflareKey(env)
+      if (!cfKey || !env.CLOUDFLARE_ACCOUNT_ID) {
+        ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
+        await releaseLock()
+        return json({ error: "no_api_key", message: "No Cloudflare account ID or API token configured" }, 500, responseHeaders())
+      }
+      const cfHeaders = new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${cfKey}` })
+      response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers: cfHeaders, body: JSON.stringify(body) })
+      if (!response.ok && (response.status === 429 || response.status === 401)) markCloudflareKeyRateLimited(cfKey)
     }
-    const cfHeaders = new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${cfKey}` })
-    response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers: cfHeaders, body: JSON.stringify(body) })
-    if (!response.ok && (response.status === 429 || response.status === 401)) markCloudflareKeyRateLimited(cfKey)
   } else {
     response = await fetch(`${OPENROUTER_URL}${path}`, { method: "POST", headers, body: JSON.stringify(body) })
   }
