@@ -4318,7 +4318,7 @@ async function listModels(env: Env, cors: Record<string, string>): Promise<Respo
       errors.push({ provider: "cloudflare", status: 502, message: String(error).slice(0, 160) })
     }
   }
-  if (models.length > 0) return json({ object: "list", data: models }, 200, cors)
+  if (models.length > 0) return json({ object: "list", data: models, default: "openrouter/free" }, 200, cors)
   if (errors.length > 0) return json({ error: "models_unavailable", providers: errors }, 502, cors)
   return json({ error: "no_api_key", message: "No provider API key configured" }, 500, cors)
 }
