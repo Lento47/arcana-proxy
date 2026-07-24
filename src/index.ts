@@ -2514,7 +2514,9 @@ async function proxyWithFailover(
   }
 
   // Free tier: quality-ranked free pool + optional free-long when request is large
-  if (user.tier === "free" && path === "/v1/chat/completions") {
+  // cf/ and cloudflare/ models bypass free remapping — they go direct to Cloudflare
+  const isCloudflareModel = requestedModel.startsWith("cf/") || requestedModel.startsWith("cloudflare/")
+  if (user.tier === "free" && path === "/v1/chat/completions" && !isCloudflareModel) {
     freePool = await getFreePool(env)
     const ensured = ensureFreeModel(requestedModel, freePool, { preferLong })
     freeModelRemap = ensured.remapped || ensured.model !== stripProviderPrefix(originalRequestedModel)
