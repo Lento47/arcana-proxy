@@ -2709,11 +2709,14 @@ async function proxyWithFailover(
         const useGateway = !!(gatewayEndpoint && gatewayKey)
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         if (useGateway) {
-          const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path.replace(/^\/v1/, "")}`
+          const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path}`
+          const cfKey = getCloudflareKey(env)
           const headers = new Headers({
             "Content-Type": "application/json",
             "cf-aig-authorization": `Bearer ${gatewayKey}`,
           })
+          // Gateway proxies to Workers AI — pass the Workers AI token so the upstream call authenticates
+          if (cfKey) headers.set("Authorization", `Bearer ${cfKey}`)
           response = await fetch(gwUrl, { method: "POST", headers, body: JSON.stringify(outbound) })
           providerKey = gatewayKey
           if (!response.ok && (response.status === 429 || response.status === 401)) markGatewayKeyRateLimited(gatewayKey)
