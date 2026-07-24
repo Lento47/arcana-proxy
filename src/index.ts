@@ -2706,9 +2706,11 @@ async function proxyWithFailover(
       } else if (provider === "cloudflare") {
         // AI Gateway path: uses gateway endpoint + pool of gateway API keys when configured
         const gatewayEndpoint = env.CLOUDFLARE_AI_GATEWAY_ENDPOINT?.trim()
-        const gatewayKey = getGatewayKey(env)
+        // Read keys directly from env (pool has caching issues on warm starts)
+        const rawKeys = env.CLOUDFLARE_AI_GATEWAY_KEYS || env.CLOUDFLARE_AI_GATEWAY_KEY || ""
+        const gatewayKey = rawKeys.split(",")[0]?.trim() || null
         const useGateway = !!(gatewayEndpoint && gatewayKey)
-        console.log("[gateway] endpoint exists=", !!gatewayEndpoint, "hasKey=", !!gatewayKey, "keyLen=", gatewayKey?.length, "keyPrefix=", gatewayKey?.slice(0, 8))
+        console.log("[gateway] endpoint=", !!gatewayEndpoint, "keyLen=", gatewayKey?.length, "keyStart=", gatewayKey?.slice(0, 8))
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         if (useGateway) {
           const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path}`
