@@ -472,11 +472,7 @@ function buildAttemptOrder(
   priority: Provider[],
   freeCap: boolean,
 ): Provider[] {
-  // Free tier: OpenRouter only — never aihubmix/omni paid routes (P0 free isolation).
-  if (freeCap) {
-    return ["openrouter"]
-  }
-
+  // Hard-forced providers (cf/, omni/, or/) override the free cap and priority list
   const hardForce =
     requestedModel.startsWith("omni/")
     || requestedModel.startsWith("or/")
@@ -484,6 +480,11 @@ function buildAttemptOrder(
     || requestedModel.startsWith("cloudflare/")
 
   if (hardForce) return [resolved.provider]
+
+  // Free tier: OpenRouter only — never aihubmix/omni paid routes (P0 free isolation).
+  if (freeCap) {
+    return ["openrouter"]
+  }
 
   let order: Provider[]
   if (requestedModel.startsWith("aihubmix/") || requestedModel.startsWith("aihub/")) {
