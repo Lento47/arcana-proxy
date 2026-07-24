@@ -11,6 +11,11 @@
   "compatibility_date": "2026-06-01",
   "workers_dev": true,
 
+  "vars": {
+    "CLOUDFLARE_AI_GATEWAY_ENDPOINT": "https://gateway.ai.cloudflare.com/v1/a0880a963b36e3bb7150104a0fa1a613/arcana-ai",
+    "CLOUDFLARE_ACCOUNT_ID": "a0880a963b36e3bb7150104a0fa1a613"
+  },
+
   "routes": [
     // First-level subdomain — Universal SSL works. Multi-level proxy.arcana.otnelhq.com
     // needs Advanced Certificate Manager (TLS handshake fails without it).
