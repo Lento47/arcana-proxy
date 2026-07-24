@@ -1578,7 +1578,10 @@ export default {
       switch (url.pathname) {
         case "/v1/chat/completions":
         case "/v1/embeddings":
-          return proxyWithFailover(request, env, user, corsHeaders, url.pathname, ctx)
+          return proxyWithFailover(request, env, user, corsHeaders, url.pathname, ctx, {
+            freeDailyLimit,
+            freeDailyRemaining,
+          })
         case "/v1/images/generations":
         case "/v1/images":
           if (request.method === "POST") return handleImageGeneration(request, env, user, corsHeaders, ctx)
@@ -1697,7 +1700,17 @@ export default {
   },
 }
 
-async function proxyOpenRouter(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
+async function proxyOpenRouter(
+  request: Request,
+  env: Env,
+  user: { id: string; tier: string },
+  cors: Record<string, string>,
+  path: string,
+  ctx: ExecutionContext,
+  dailyCaps: { freeDailyLimit?: number; freeDailyRemaining?: number } = {},
+): Promise<Response> {
+  const freeDailyLimit = dailyCaps.freeDailyLimit ?? FREE_DAILY_LIMIT
+  const freeDailyRemaining = dailyCaps.freeDailyRemaining ?? 0
   let body = await request.json() as any
   if (!body.model) return json({ error: "model_required" }, 400, cors)
 
@@ -2185,7 +2198,17 @@ function humanizeUpstreamError(provider: string, status: number, bodyText: strin
 // but routes through the priority list with hard-failure failover. Bare model
 // names walk the priority list; omni/<model> / or/<model> force a specific
 // provider. proxyOpenRouter is unchanged.
-async function proxyWithFailover(request: Request, env: Env, user: { id: string; tier: string }, cors: Record<string, string>, path: string, ctx: ExecutionContext): Promise<Response> {
+async function proxyWithFailover(
+  request: Request,
+  env: Env,
+  user: { id: string; tier: string },
+  cors: Record<string, string>,
+  path: string,
+  ctx: ExecutionContext,
+  dailyCaps: { freeDailyLimit?: number; freeDailyRemaining?: number } = {},
+): Promise<Response> {
+  const freeDailyLimit = dailyCaps.freeDailyLimit ?? FREE_DAILY_LIMIT
+  const freeDailyRemaining = dailyCaps.freeDailyRemaining ?? 0
   let body = await request.json() as any
   if (!body.model) return json({ error: "model_required" }, 400, cors)
   const originalRequestedModel = String(body.model)
