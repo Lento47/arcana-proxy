@@ -2655,14 +2655,25 @@ async function proxyWithFailover(
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         response = await fetchAIHubMix(path, { method: "POST", headers, body: JSON.stringify(outbound) })
       } else if (provider === "cloudflare") {
-        providerKey = getCloudflareKey(env)
-        if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_cloudflare_key"; continue }
-        const headers = new Headers({
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${providerKey}`,
-        })
+        // AI Gateway path: uses gateway endpoint + gateway API key when configured
+        const useGateway = !!(env.CLOUDFLARE_AI_GATEWAY_ENDPOINT && env.CLOUDFLARE_AI_GATEWAY_KEY)
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
-        response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
+        if (useGateway) {
+          const gwUrl = `${env.CLOUDFLARE_AI_GATEWAY_ENDPOINT!.replace(/\/+$/, "")}/workers-ai${path}`
+          const headers = new Headers({
+            "Content-Type": "application/json",
+            "cf-aig-authorization": `Bearer ${env.CLOUDFLARE_AI_GATEWAY_KEY}`,
+          })
+          response = await fetch(gwUrl, { method: "POST", headers, body: JSON.stringify(outbound) })
+        } else {
+          providerKey = getCloudflareKey(env)
+          if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_cloudflare_key"; continue }
+          const headers = new Headers({
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${providerKey}`,
+          })
+          response = await fetch(`${cloudflareBaseURL(env)}${path}`, { method: "POST", headers, body: JSON.stringify(outbound) })
+        }
       } else {
         providerKey = getOmniKey(env)
         if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_omniroute_key"; continue }
