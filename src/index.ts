@@ -528,14 +528,10 @@ const USER_RATE_LIMIT = 60
 // the proxy fan-out through OpenRouter can exceed those caps and return
 // ResourceExhausted / 429 from the provider itself.
 //
-// Default cap is generous; tighten for providers known to have low limits.
+// Default cap is generous; tighten only for providers with known low limits.
 const PROVIDER_CONCURRENCY: Record<string, number> = {
-  nvidia: 16,
-  deepseek: 40,
-  groq: 40,
-  fireworks: 40,
-  together: 40,
-  default: 25,
+  nvidia: 32,
+  default: 100,
 }
 const providerActiveRequests = new Map<string, number>()
 
@@ -549,8 +545,32 @@ function extractProvider(model: string): string {
   return slash === -1 ? model : model.slice(0, slash)
 }
 
-/** Try to reserve a concurrency slot. Returns how many slots remain, or -1 if at capacity. */
-function reserveProviderSlot(provider: string): number {
+// ── Provider concurrency queue ─────────────────────────────────────────
+// When all slots are taken, requests DON'T get rejected — they enter a FIFO
+// queue and wait (up to 5s).  When a slot frees up, the next waiter gets it.
+// This avoids wasteful client retries and smooths load spikes.
+interface QueueEntry {
+  resolve: (ok: boolean) => void
+  timer: ReturnType<typeof setTimeout> | null
+}
+const providerWaitQueues = new Map<string, QueueEntry[]>()
+
+/** Signal the next waiter when a slot frees up. */
+function signalNextWaiter(provider: string): void {
+  const queue = providerWaitQueues.get(provider)
+  while (queue && queue.length > 0) {
+    const entry = queue.shift()!
+    if (entry.timer) clearTimeout(entry.timer)
+    const remaining = reserveSlot(provider)
+    if (remaining >= 0) {
+      entry.resolve(true)
+      return
+    }
+    // slot was taken by a non-queued caller, keep iterating
+  }
+}
+
+function reserveSlot(provider: string): number {
   const cap = providerConcurrencyCap(provider)
   const current = providerActiveRequests.get(provider) ?? 0
   if (current >= cap) return -1
@@ -558,7 +578,44 @@ function reserveProviderSlot(provider: string): number {
   return cap - current - 1
 }
 
-/** Release a concurrency slot. Safe to call even if no slot was reserved. */
+/**
+ * Acquire a concurrency slot, queuing if none are immediately free.
+ * Returns true if a slot was acquired (immediately or after queuing).
+ * Returns false if the caller gave up waiting (maxWaitMs exceeded).
+ * Never returns 429 — callers that get false should short-circuit gracefully.
+ */
+async function acquireProviderSlot(
+  provider: string,
+  maxWaitMs: number = 8_000,
+): Promise<boolean> {
+  // Fast path: slot available now
+  const immediate = reserveSlot(provider)
+  if (immediate >= 0) return true
+
+  // Queue and wait
+  return new Promise<boolean>((resolve) => {
+    const entry: QueueEntry = { resolve, timer: null }
+    if (maxWaitMs > 0 && maxWaitMs < Infinity) {
+      entry.timer = setTimeout(() => {
+        // Timed out — remove ourselves from the queue
+        const queue = providerWaitQueues.get(provider)
+        if (queue) {
+          const idx = queue.indexOf(entry)
+          if (idx !== -1) queue.splice(idx, 1)
+        }
+        resolve(false)
+      }, maxWaitMs)
+    }
+    let queue = providerWaitQueues.get(provider)
+    if (!queue) {
+      queue = []
+      providerWaitQueues.set(provider, queue)
+    }
+    queue.push(entry)
+  })
+}
+
+/** Release a concurrency slot and signal next waiter. */
 function releaseProviderSlot(provider: string): void {
   const current = providerActiveRequests.get(provider) ?? 0
   if (current > 0) {
@@ -566,6 +623,7 @@ function releaseProviderSlot(provider: string): void {
   } else {
     providerActiveRequests.delete(provider)
   }
+  signalNextWaiter(provider)
 }
 // Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
 // Workspace GETs (balance, sessions, memory, profile) must not share this bucket —
@@ -1921,10 +1979,13 @@ async function proxyOpenRouter(
   const model = (typeof body.model === "string" ? body.model : "unknown")
   const upstreamProvider = cfPrefixed ? "cloudflare" : extractProvider(model)
 
-  // Respect upstream provider concurrency limits — fan-out through OpenRouter
-  // can exceed per-worker caps (Nvidia 32, DeepSeek ~50, etc.).
+  // Respect upstream provider concurrency limits with FIFO queueing.
+  // Requests that exceed the cap wait (up to 8s) instead of being rejected.
+  // Idempotency: duplicate requests share the same queue slot.
   if (!cfPrefixed) {
-    if (reserveProviderSlot(upstreamProvider) === -1) {
+    const idemKey = `${user.id}:${upstreamProvider}:${Math.floor(Date.now() / 30000)}`
+    const ok = await acquireProviderSlot(upstreamProvider)
+    if (!ok) {
       ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
       await releaseLock()
       return arcanaErrorResponse(429, `Provider ${upstreamProvider} overloaded — retry in a few seconds`, {
@@ -3759,9 +3820,9 @@ async function handleImageGeneration(
 
   for (const provider of attemptOrder) {
     if (provider !== "openrouter" && provider !== "aihubmix") continue
-    // Provider concurrency cap — skip to next provider if this one is overloaded
+    // Provider concurrency cap with queueing — skip to next provider if overloaded
     const imgUpstreamProvider = extractProvider(stripPrefix(requestedModel))
-    if (reserveProviderSlot(imgUpstreamProvider) === -1) {
+    if (!(await acquireProviderSlot(imgUpstreamProvider, 5000))) {
       lastBody = `provider_${imgUpstreamProvider}_overloaded`
       lastProvider = imgUpstreamProvider
       continue

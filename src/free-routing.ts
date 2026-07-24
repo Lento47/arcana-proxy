@@ -77,9 +77,9 @@ export const FREE_MAX_INPUT_TOKENS = FREE_BUDGET.expanded.maxInputTokens
 export const FREE_MAX_OUTPUT_TOKENS = FREE_BUDGET.expanded.maxOutputTokens
 
 /** Rate limits sized for ~5k free MAU (peak ~50–100 free LLM req/min globally) */
-export const FREE_IP_RATE_LIMIT = 15 // scaled for ~5k free MAU: 15 RPM per-IP + per-user headroom
-export const FREE_USER_RATE_LIMIT = 8 // scaled for ~5k free MAU: 8 RPM per-user
-export const FREE_GLOBAL_SOFT_RPM = 200 // isolate-local soft brake for free LLM paths
+export const FREE_IP_RATE_LIMIT = 30   // per-IP RPM — generous for agentic usage (5-10 calls/turn)
+export const FREE_USER_RATE_LIMIT = 20  // per-user RPM — 3-4 agent turns/min without throttling
+export const FREE_GLOBAL_SOFT_RPM = 500 // isolate-local soft brake for free LLM paths
 
 const CHINESE_RE =
   /qwen|deepseek|glm|yi-|moonshot|kimi|minimax|baichuan|internlm|stepfun|doubao|hunyuan|ernie|zhipu|01-ai|alibaba|tencent|bytedance|hy3|seedream|yuanbao/i
@@ -610,15 +610,13 @@ const LOAD_BANDS: BandDef[] = [
  * 4 = red low.
  */
 const RESOURCE_RANGES = {
-  // Loosened ranges: under load the system still provides generous budgets.
-  // Single-user deployments should never hit restrictive territory unless the
-  // upstream is fully saturated — and even then we want enough runway to find
-  // a working model.
-  turnTimeoutMs:   [60_000, 45_000, 30_000, 20_000, 12_000],
+  // Real model response times: slow models (Nvidia, some DeepSeek) take 20-40s.
+  // Red band at 30s means even the slowest models get time to finish.
+  turnTimeoutMs:   [120_000, 90_000, 60_000, 40_000, 30_000],
   outputLimit:     [100_000, 80_000, 50_000, 30_000, 15_000],
   failoverCount:   [20, 15, 10, 6, 3],
-  userRpm:         [12, 10, 8, 6, 4],
-  ipRpm:           [25, 20, 15, 10, 6],
+  userRpm:         [20, 16, 12, 10, 8],
+  ipRpm:           [40, 30, 20, 15, 10],
 }
 
 /** Scale a resource value within its current band based on load factor progress. */

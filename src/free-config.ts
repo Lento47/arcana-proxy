@@ -25,4 +25,4 @@ export const FREE_WEEKLY_TOKEN_AGGREGATE = 1_000_000_000
 export const FREE_TURN_MAX_DURATION_MS = 60_000
 
 /** Soft daily request ceiling for free tier — prevents scripted abuse without binding real usage. */
-export const FREE_DAILY_LIMIT = 500
+export const FREE_DAILY_LIMIT = 5000
