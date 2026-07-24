@@ -373,9 +373,21 @@ headers, plus `used` and `remaining` integer fields).
 > now either — the weekly cooldown is enforced by the persisted expired record returning
 > `free_session_expired` until `resetAt`.
 
-The free-tier spec calls for these errors to be treated as **terminal** on the client side — no
-automatic retry. The `Retry-After` header is **not currently set** by the proxy for any of these
-codes; the spec lists it as a future addition alongside the DO migration.
+The free-tier spec calls for these free-session errors to be treated as **terminal** on the client
+side — no automatic retry. Separately, **burst / concurrency 429s** from the proxy **do** set
+`Retry-After` so clients can honor the wait:
+
+| Path | Typical `Retry-After` |
+| --- | --- |
+| IP rate limit | `10` |
+| User rate limit (`USER_RATE_LIMIT` req/min) | `10` |
+| Free IP / free user burst | `10` |
+| Free global soft limit | `60` |
+| Daily limit | seconds until UTC midnight |
+| Per-user lock conflict | `3` |
+
+Free-session terminal rejects (`free_session_expired`, conversation mismatch, turn timed out, etc.)
+remain non-retryable; prefer the structured `error.code` / `ARC_*` body over blind backoff.
 
 ### Bypass behavior
 

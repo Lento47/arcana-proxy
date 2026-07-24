@@ -100,8 +100,9 @@ effortScore = tokensIn × 0.3 + tokensOut × 0.7 + providerCalls × 10
   - `free_weekly_cooldown` removed from the rejection table (the proxy never
     emits it; the gap is called out as a known limit to be closed by the DO
     migration).
-  - `Retry-After` claim removed (no 429 response currently sets it; flagged as
-    a future addition).
+  - `Retry-After` is set on burst/concurrency 429s (IP/user RPM, free burst,
+    global soft limit, daily limit, lock conflict). Free-session terminal
+    rejects stay non-retryable without relying on that header.
   - New "Other response headers" block documents `X-Provider` and
     `X-RateLimit-Remaining` (set on per-day-limit responses, not on free-tier
     rejections).

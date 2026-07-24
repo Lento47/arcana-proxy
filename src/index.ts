@@ -1461,8 +1461,13 @@ export default {
 
     // IP-based rate limiting (all endpoints)
     const ipRl = checkRateLimit(clientIp, ipLimits, IP_RATE_LIMIT)
-    if (!ipRl.allowed)          corsHeaders["Retry-After"] = "10"
-          return json({ error: "rate_limited", message: "IP rate limit exceeded: 50 req/min" }, 429, corsHeaders)
+    if (!ipRl.allowed) {
+      corsHeaders["Retry-After"] = "10"
+      return arcanaErrorResponse(429, `IP rate limit exceeded: ${IP_RATE_LIMIT} req/min`, {
+        code: "ARC_RATE_LIMITED",
+        cors: corsHeaders,
+      })
+    }
 
     try {
       // Public endpoints (IP rate limit only)
@@ -1498,15 +1503,21 @@ export default {
 
       // User rate limiting (per-minute) — all authenticated routes
       const userRl = checkRateLimit(user.id, userLimits, USER_RATE_LIMIT)
-      if (!userRl.allowed) return json({ error: "rate_limited", message: "25 req/min per user" }, 429, corsHeaders)
+      if (!userRl.allowed) {
+        corsHeaders["Retry-After"] = "10"
+        return arcanaErrorResponse(429, `${USER_RATE_LIMIT} req/min per user`, {
+          code: "ARC_RATE_LIMITED",
+          cors: corsHeaders,
+        })
+      }
 
       const isLlmPath = FREE_BURST_PATHS.has(url.pathname)
 
       // Free-tier burst limits only on LLM routes (chat/embeddings). Workspace
-      // reads (balance/sessions/memory/profile) stay under the general 25/min cap.
+      // reads (balance/sessions/memory/profile) stay under the general USER_RATE_LIMIT cap.
       if (user.tier === "free" && isLlmPath) {
-        // Global soft brake (~5k free users peak safety; isolate-local)
-        if (!freeGlobalAllow(FREE_GLOBAL_SOFT_RPM)) {
+        // Global soft brake (~5k free users peak safety; per-user token bucket)
+        if (!freeGlobalAllow(user.id, FREE_GLOBAL_SOFT_RPM)) {
           corsHeaders["Retry-After"] = "60"
           return arcanaErrorResponse(429, "free global soft rate limit", {
             code: "ARC_RATE_LIMITED",
@@ -1701,7 +1712,12 @@ async function proxyOpenRouter(request: Request, env: Env, user: { id: string; t
   await env.ARCANA_PROXY.put(lockKey, lockValue, { expirationTtl: 60 })
   const currentLock = await env.ARCANA_PROXY.get(lockKey)
   if (currentLock !== lockValue && user.tier !== "enterprise") {
-    return json({ error: "too_many_requests", message: "A previous request is still processing." }, 429, cors)
+    // Lock TTL is 60s; locks usually release quickly after the prior request finishes.
+    cors["Retry-After"] = "3"
+    return arcanaErrorResponse(429, "A previous request is still processing.", {
+      code: "ARC_RATE_LIMITED",
+      cors,
+    })
   }
   const releaseLock = async () => {
     try {
@@ -2251,7 +2267,12 @@ async function proxyWithFailover(request: Request, env: Env, user: { id: string;
   await env.ARCANA_PROXY.put(lockKey, lockValue, { expirationTtl: 60 })
   const currentLock = await env.ARCANA_PROXY.get(lockKey)
   if (currentLock !== lockValue && user.tier !== "enterprise") {
-    return json({ error: "too_many_requests", message: "A previous request is still processing." }, 429, cors)
+    // Lock TTL is 60s; locks usually release quickly after the prior request finishes.
+    cors["Retry-After"] = "3"
+    return arcanaErrorResponse(429, "A previous request is still processing.", {
+      code: "ARC_RATE_LIMITED",
+      cors,
+    })
   }
   const releaseLock = async () => {
     try {

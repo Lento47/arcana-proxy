@@ -464,46 +464,106 @@ export function wantsLongContext(body: any, headerFlag?: string | null): boolean
   return chars >= 12_000
 }
 
-// ── EWMA Global free soft rate (per isolate — best-effort for 5k scale) ────
+// ── Per-user global soft brake (token-bucket) ──────────────────────────
 //
-// EWMA-smoothed load tracker.  rawCount is the instantaneous sliding-window
-// count (same as before).  smoothedLoad is an EWMA of that count, updated
-// on every allow().  This prevents a single burst from looking like sustained
-// load — the load factor only rises if the burst persists.
+// Replaced the isolate-local sliding window with per-user token buckets.
+// The old sliding window counted ALL free requests on the isolate — when many
+// users shared the same isolate (Cloudflare autoscaling), one user's legitimate
+// traffic could push the isolate over FREE_GLOBAL_SOFT_RPM and block unrelated
+// users.  A per-user token bucket eliminates cross-user contention entirely.
+//
+// Each user gets a bucket with effectiveLimit = FREE_GLOBAL_SOFT_RPM (200/min)
+// and burst capacity of 3× (600 tokens).  No BIAS_MULTIPLIER is applied —
+// the global soft brake is a system-level safety net, not a per-user fairness
+// limit.  Single-user bias would defeat its purpose.
+//
+// The aggregate load signal (for getLoadLevel() / response headers) is still
+// maintained as a sliding window + EWMA of ALLOWED requests across all users.
+// This is only used for load sensing, not for rate limiting decisions.
 
-const freeGlobalHits: number[] = []
+interface FreeGlobalBucket {
+  tokens: number
+  lastRefill: number
+}
 
+const freeGlobalUserLimits = new Map<string, FreeGlobalBucket>()
+
+// Aggregate load signal (for freeGlobalLoad / getLoadLevel)
+const freeGlobalAggregateHits: number[] = []
 let globalLoadEwma = 0
 let globalLoadEwmaLast = 0
 const GLOBAL_LOAD_EWMA_ALPHA = 0.25
 
-export function freeGlobalAllow(rpm = FREE_GLOBAL_SOFT_RPM): boolean {
+let freeGlobalCleanupCounter = 0
+const FREE_GLOBAL_CLEANUP_INTERVAL = 100
+const FREE_GLOBAL_BUCKET_STALE_MS = 5 * 60 * 1000  // 5 minutes
+
+/**
+ * Per-user global soft brake using token-bucket algorithm.
+ * Returns true if the request is allowed, false if rate-limited.
+ */
+export function freeGlobalAllow(userId: string, rpm = FREE_GLOBAL_SOFT_RPM): boolean {
   const now = Date.now()
-  while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
+  const effectiveLimit = rpm
+  const refillRate = effectiveLimit / 60_000  // tokens per ms
+  const maxTokens = effectiveLimit * 3  // BURST_MULTIPLIER = 3
 
-  // Update EWMA load (before adding this request, so it reflects prior load)
-  if (globalLoadEwmaLast > 0 && now > globalLoadEwmaLast) {
-    globalLoadEwma = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
-  } else if (globalLoadEwmaLast === 0) {
-    globalLoadEwma = freeGlobalHits.length
+  let bucket = freeGlobalUserLimits.get(userId)
+  if (!bucket) {
+    bucket = { tokens: maxTokens, lastRefill: now }
+    freeGlobalUserLimits.set(userId, bucket)
   }
-  globalLoadEwmaLast = now
 
-  if (freeGlobalHits.length >= rpm) return false
-  freeGlobalHits.push(now)
-  return true
+  // Refill tokens based on time elapsed
+  const elapsed = now - bucket.lastRefill
+  if (elapsed > 0) {
+    bucket.tokens = Math.min(maxTokens, bucket.tokens + refillRate * elapsed)
+  }
+  bucket.lastRefill = now
+
+  // Allow if we have at least 1 token
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1
+
+    // Update aggregate load signal (for freeGlobalLoad / getLoadLevel)
+    freeGlobalAggregateHits.push(now)
+    while (freeGlobalAggregateHits.length && now - freeGlobalAggregateHits[0]! > 60_000) {
+      freeGlobalAggregateHits.shift()
+    }
+
+    // Update EWMA (after recording this request, so it includes current load)
+    if (globalLoadEwmaLast > 0 && now > globalLoadEwmaLast) {
+      globalLoadEwma = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalAggregateHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
+    } else if (globalLoadEwmaLast === 0) {
+      globalLoadEwma = freeGlobalAggregateHits.length
+    }
+    globalLoadEwmaLast = now
+
+    // Periodic cleanup of stale per-user buckets
+    freeGlobalCleanupCounter++
+    if (freeGlobalCleanupCounter % FREE_GLOBAL_CLEANUP_INTERVAL === 0) {
+      const staleThreshold = now - FREE_GLOBAL_BUCKET_STALE_MS
+      for (const [key, b] of freeGlobalUserLimits) {
+        if (b.lastRefill < staleThreshold) freeGlobalUserLimits.delete(key)
+      }
+    }
+
+    return true
+  }
+
+  return false
 }
 
 export function freeGlobalLoad(): number {
   const now = Date.now()
-  while (freeGlobalHits.length && now - freeGlobalHits[0]! > 60_000) freeGlobalHits.shift()
+  while (freeGlobalAggregateHits.length && now - freeGlobalAggregateHits[0]! > 60_000) {
+    freeGlobalAggregateHits.shift()
+  }
   // Return the EWMA-smoothed value without mutating state.
   // Only freeGlobalAllow() updates the EWMA — this keeps the smoothed
   // signal stable when load is queried multiple times in one request cycle.
   if (globalLoadEwmaLast > 0 && now > globalLoadEwmaLast) {
-    // Compute what the EWMA would be, but leave globalLoadEwma alone
-    // so a subsequent freeGlobalAllow() doesn't double-count.
-    const updated = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
+    const updated = GLOBAL_LOAD_EWMA_ALPHA * freeGlobalAggregateHits.length + (1 - GLOBAL_LOAD_EWMA_ALPHA) * globalLoadEwma
     return Math.round(Math.max(0, updated))
   }
   return Math.round(Math.max(0, globalLoadEwma))
