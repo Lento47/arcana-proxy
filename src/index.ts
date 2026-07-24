@@ -2708,8 +2708,7 @@ async function proxyWithFailover(
         const gatewayEndpoint = env.CLOUDFLARE_AI_GATEWAY_ENDPOINT?.trim()
         const gatewayKey = getGatewayKey(env)
         const useGateway = !!(gatewayEndpoint && gatewayKey)
-        console.log("[gateway] endpoint=", gatewayEndpoint?.slice(0, 60), "hasKey=", !!gatewayKey, "useGateway=", useGateway)
-        if (!useGateway) console.log("[gateway] falling back to direct Workers AI")
+        console.log("[gateway] endpoint exists=", !!gatewayEndpoint, "hasKey=", !!gatewayKey, "keyLen=", gatewayKey?.length, "keyPrefix=", gatewayKey?.slice(0, 8))
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         if (useGateway) {
           const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path}`
