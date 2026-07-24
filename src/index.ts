@@ -67,7 +67,8 @@ interface Env {
   CLOUDFLARE_KEYS?: string      // comma-separated pool of Cloudflare API tokens (Workers AI: Read)
   CLOUDFLARE_ACCOUNT_ID?: string  // Cloudflare account ID; required for Workers AI
   CLOUDFLARE_AI_GATEWAY_ENDPOINT?: string  // AI Gateway base URL (e.g. https://gateway.ai.cloudflare.com/v1/{account}/{gateway})
-  CLOUDFLARE_AI_GATEWAY_KEY?: string       // AI Gateway API key (required when GATEWAY_ENDPOINT is set)
+  CLOUDFLARE_AI_GATEWAY_KEY?: string       // AI Gateway API key (when set, cf/ models route through AI Gateway)
+  CLOUDFLARE_AI_GATEWAY_KEYS?: string     // comma-separated pool of AI Gateway API keys for rotation
   PAYPAL_CLIENT_ID: string
   PAYPAL_CLIENT_SECRET: string
   PAYPAL_SANDBOX?: string
@@ -294,6 +295,53 @@ function markCloudflareKeySuccess(key: string): void {
   if (ks) ks.failures = 0
 }
 // --- end Cloudflare key pool ---
+
+// --- Cloudflare AI Gateway key pool (rotation + rate-limit cooldown) ---
+let gatewayKeyPool: KeyState[] = []
+let gatewayKeyPoolIndex = 0
+
+function initGatewayKeyPool(env: Env): KeyState[] {
+  if (gatewayKeyPool.length > 0) return gatewayKeyPool
+  const raw = env.CLOUDFLARE_AI_GATEWAY_KEYS || env.CLOUDFLARE_AI_GATEWAY_KEY || ""
+  const keys = raw.split(",").map(k => k.trim()).filter(Boolean)
+  if (keys.length === 0) return []
+  gatewayKeyPool = keys.map(k => ({ key: k, cooldownUntil: 0, failures: 0 }))
+  return gatewayKeyPool
+}
+
+function getGatewayKey(env: Env): string | null {
+  const pool = initGatewayKeyPool(env)
+  if (pool.length === 0) return null
+  const now = Date.now()
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (gatewayKeyPoolIndex + i) % pool.length
+    const ks = pool[idx]
+    if (now >= ks.cooldownUntil) {
+      gatewayKeyPoolIndex = (idx + 1) % pool.length
+      return ks.key
+    }
+  }
+  const best = pool.reduce((a, b) => a.cooldownUntil < b.cooldownUntil ? a : b)
+  return best.key
+}
+
+function markGatewayKeyRateLimited(key: string): void {
+  const ks = gatewayKeyPool.find(k => k.key === key)
+  if (!ks) return
+  const now = Date.now()
+  ks.failures++
+  const backoff = KEY_COOLDOWN_MS * Math.pow(2, Math.min(ks.failures - 1, 3))
+  ks.cooldownUntil = now + backoff
+  if (ks.failures >= KEY_MAX_FAILURES) {
+    ks.cooldownUntil = now + 5 * 60 * 1000
+  }
+}
+
+function markGatewayKeySuccess(key: string): void {
+  const ks = gatewayKeyPool.find(k => k.key === key)
+  if (ks) ks.failures = 0
+}
+// --- end Gateway key pool ---
 
 async function fetchAIHubMix(path: string, init: RequestInit): Promise<Response> {
   let lastError: unknown
@@ -2655,16 +2703,21 @@ async function proxyWithFailover(
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         response = await fetchAIHubMix(path, { method: "POST", headers, body: JSON.stringify(outbound) })
       } else if (provider === "cloudflare") {
-        // AI Gateway path: uses gateway endpoint + gateway API key when configured
-        const useGateway = !!(env.CLOUDFLARE_AI_GATEWAY_ENDPOINT && env.CLOUDFLARE_AI_GATEWAY_KEY)
+        // AI Gateway path: uses gateway endpoint + pool of gateway API keys when configured
+        const gatewayEndpoint = env.CLOUDFLARE_AI_GATEWAY_ENDPOINT?.trim()
+        const gatewayKey = getGatewayKey(env)
+        const useGateway = !!(gatewayEndpoint && gatewayKey)
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         if (useGateway) {
-          const gwUrl = `${env.CLOUDFLARE_AI_GATEWAY_ENDPOINT!.replace(/\/+$/, "")}/workers-ai${path}`
+          const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path}`
           const headers = new Headers({
             "Content-Type": "application/json",
-            "cf-aig-authorization": `Bearer ${env.CLOUDFLARE_AI_GATEWAY_KEY}`,
+            "cf-aig-authorization": `Bearer ${gatewayKey}`,
           })
           response = await fetch(gwUrl, { method: "POST", headers, body: JSON.stringify(outbound) })
+          providerKey = gatewayKey
+          if (!response.ok && (response.status === 429 || response.status === 401)) markGatewayKeyRateLimited(gatewayKey)
+          else if (response.ok) markGatewayKeySuccess(gatewayKey)
         } else {
           providerKey = getCloudflareKey(env)
           if (!providerKey) { lastErrorStatus = 500; lastErrorBody = "no_cloudflare_key"; continue }
