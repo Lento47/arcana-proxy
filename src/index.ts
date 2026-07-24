@@ -2709,10 +2709,10 @@ async function proxyWithFailover(
         const useGateway = !!(gatewayEndpoint && gatewayKey)
         const outbound = sanitizeChatCompletionsBody({ ...body, model: upstreamModel, user: user.id }, provider)
         if (useGateway) {
-          const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path}`
+          const gwUrl = `${gatewayEndpoint.replace(/\/+$/, "")}/workers-ai${path.replace(/^\/v1/, "")}`
           const headers = new Headers({
             "Content-Type": "application/json",
-            "cf-aig-authorization": `Bearer ${gatewayKey}`,
+            "cf-aig-authorization": gatewayKey!,
           })
           response = await fetch(gwUrl, { method: "POST", headers, body: JSON.stringify(outbound) })
           providerKey = gatewayKey
