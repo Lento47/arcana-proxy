@@ -522,6 +522,51 @@ const freeIpLimits = new Map<string, TokenBucket>()
 const freeUserLimits = new Map<string, TokenBucket>()
 const IP_RATE_LIMIT = 50
 const USER_RATE_LIMIT = 60
+
+// ── Provider concurrency tracking (per-isolate) ─────────────────────────
+// Upstream providers have per-worker concurrent request caps. Without this
+// the proxy fan-out through OpenRouter can exceed those caps and return
+// ResourceExhausted / 429 from the provider itself.
+//
+// Default cap is generous; tighten for providers known to have low limits.
+const PROVIDER_CONCURRENCY: Record<string, number> = {
+  nvidia: 16,
+  deepseek: 40,
+  groq: 40,
+  fireworks: 40,
+  together: 40,
+  default: 25,
+}
+const providerActiveRequests = new Map<string, number>()
+
+function providerConcurrencyCap(provider: string): number {
+  return PROVIDER_CONCURRENCY[provider] ?? PROVIDER_CONCURRENCY.default
+}
+
+/** Returns the provider prefix from a model name (e.g. "nvidia/nemotron" → "nvidia"). */
+function extractProvider(model: string): string {
+  const slash = model.indexOf("/")
+  return slash === -1 ? model : model.slice(0, slash)
+}
+
+/** Try to reserve a concurrency slot. Returns how many slots remain, or -1 if at capacity. */
+function reserveProviderSlot(provider: string): number {
+  const cap = providerConcurrencyCap(provider)
+  const current = providerActiveRequests.get(provider) ?? 0
+  if (current >= cap) return -1
+  providerActiveRequests.set(provider, current + 1)
+  return cap - current - 1
+}
+
+/** Release a concurrency slot. Safe to call even if no slot was reserved. */
+function releaseProviderSlot(provider: string): void {
+  const current = providerActiveRequests.get(provider) ?? 0
+  if (current > 0) {
+    providerActiveRequests.set(provider, current - 1)
+  } else {
+    providerActiveRequests.delete(provider)
+  }
+}
 // Free-tier burst limits apply only to expensive LLM routes (chat/embeddings).
 // Workspace GETs (balance, sessions, memory, profile) must not share this bucket —
 // a single dashboard load is already 3–5 parallel requests and used to 429 at 8/min.
@@ -1873,6 +1918,22 @@ async function proxyOpenRouter(
   // first provider in the list (openrouter today). Use the prefix to opt into cloudflare explicitly.
   const cfPrefixed = typeof body.model === "string" && (body.model.startsWith("cf/") || body.model.startsWith("cloudflare/"))
   if (cfPrefixed) body.model = body.model.replace(/^cloudflare\//, "").replace(/^cf\//, "")
+  const model = (typeof body.model === "string" ? body.model : "unknown")
+  const upstreamProvider = cfPrefixed ? "cloudflare" : extractProvider(model)
+
+  // Respect upstream provider concurrency limits — fan-out through OpenRouter
+  // can exceed per-worker caps (Nvidia 32, DeepSeek ~50, etc.).
+  if (!cfPrefixed) {
+    if (reserveProviderSlot(upstreamProvider) === -1) {
+      ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
+      await releaseLock()
+      return arcanaErrorResponse(429, `Provider ${upstreamProvider} overloaded — retry in a few seconds`, {
+        code: "ARC_RATE_LIMITED",
+        provider: upstreamProvider,
+        cors: responseHeaders(),
+      })
+    }
+  }
   const startTime = Date.now()
   const isStream = body.stream === true
   let response: Response
@@ -1895,6 +1956,7 @@ async function proxyOpenRouter(
     if (billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
     ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
     await releaseLock()
+    if (!cfPrefixed) releaseProviderSlot(upstreamProvider)
     const errorBody = await response.text()
     return arcanaErrorResponse(response.status, errorBody, {
       provider: cfPrefixed ? "cloudflare" : "openrouter",
@@ -1940,6 +2002,7 @@ async function proxyOpenRouter(
         else if (streamFailed && billableTier(user.tier)) await deductBalance(user.id, -maxCost, env.ARCANA_PROXY)
         if (streamFailed) ctx.waitUntil(settleFreeTurn(freeAdmission, "failed", env.ARCANA_PROXY, 0, 0, env))
         await releaseLock()
+        if (!cfPrefixed) releaseProviderSlot(upstreamProvider)
       }
     })()
     return new Response(readable, { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...responseHeaders() } })
@@ -1957,6 +2020,7 @@ async function proxyOpenRouter(
   }
   ctx.waitUntil(settleFreeTurn(freeAdmission, "completed", env.ARCANA_PROXY, tokensIn, tokensOut, env))
   await releaseLock()
+  if (!cfPrefixed) releaseProviderSlot(upstreamProvider)
   return json(data, response.status, responseHeaders())
 }
 
@@ -3695,6 +3759,13 @@ async function handleImageGeneration(
 
   for (const provider of attemptOrder) {
     if (provider !== "openrouter" && provider !== "aihubmix") continue
+    // Provider concurrency cap — skip to next provider if this one is overloaded
+    const imgUpstreamProvider = extractProvider(stripPrefix(requestedModel))
+    if (reserveProviderSlot(imgUpstreamProvider) === -1) {
+      lastBody = `provider_${imgUpstreamProvider}_overloaded`
+      lastProvider = imgUpstreamProvider
+      continue
+    }
     try {
       let upstream: Response
       if (provider === "openrouter") {
@@ -3819,6 +3890,8 @@ async function handleImageGeneration(
     } catch (e) {
       lastBody = String(e).slice(0, 200)
       lastStatus = 502
+    } finally {
+      releaseProviderSlot(imgUpstreamProvider)
     }
   }
 
