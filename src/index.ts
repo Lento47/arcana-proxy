@@ -1557,9 +1557,9 @@ export default {
             remaining: 0,
           }, 429, corsHeaders)
         }
+        freeDailyRemaining = daily.remaining
+        freeDailyLimit = DAILY_LIMITS[user.tier] ?? FREE_DAILY_LIMIT
       }
-      freeDailyRemaining = daily.remaining
-      freeDailyLimit = DAILY_LIMITS[user.tier] ?? FREE_DAILY_LIMIT
 
       // Match /v1/sessions/:uuid before the switch
       const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/)
